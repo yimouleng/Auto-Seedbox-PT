@@ -5,7 +5,7 @@
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
-#   -u : 用户名
+#   -u : 用户名 (用于运行服务和登录WebUI)
 #   -p : 密码（必须 ≥ 8 位）
 #   -c : qBittorrent 缓存大小 (MiB)
 #   -q : qBittorrent 版本 (4.3.9)
@@ -20,7 +20,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# ================= 0. 全局变量与配色 =================
+# ================= 0. 全局变量 =================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -43,6 +43,9 @@ CUSTOM_PORT=false
 VX_RESTORE_URL=""
 VX_ZIP_PASS=""
 INSTALLED_MAJOR_VER="4"
+
+# 默认 Home 目录，稍后根据用户动态调整
+HB="/root"
 
 TEMP_DIR=$(mktemp -d -t asp-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -112,7 +115,30 @@ get_input_port() {
     done
 }
 
-# ================= 2. 深度卸载逻辑 =================
+# ================= 2. 用户管理 (核心逻辑) =================
+
+setup_user() {
+    # 兼容 Root 用户
+    if [[ "$APP_USER" == "root" ]]; then
+        HB="/root"
+        log_info "以 Root 身份运行服务。"
+        return
+    fi
+
+    # 检测系统用户是否存在
+    if id "$APP_USER" &>/dev/null; then
+        log_info "系统用户 $APP_USER 已存在，将直接复用。"
+    else
+        log_info "创建系统用户: $APP_USER"
+        useradd -m -s /bin/bash "$APP_USER"
+    fi
+
+    # 动态获取该用户的 Home 目录
+    HB=$(eval echo ~$APP_USER)
+    log_info "工作目录设定为: $HB"
+}
+
+# ================= 3. 深度卸载逻辑 =================
 
 uninstall() {
     local mode=$1
@@ -120,32 +146,31 @@ uninstall() {
     read -p "确认要卸载所有组件吗？此操作不可逆！ [y/n]: " confirm < /dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
 
-    log_info "1. 停止并移除原生服务..."
-    systemctl stop "qbittorrent-nox@root" 2>/dev/null || true
-    systemctl disable "qbittorrent-nox@root" 2>/dev/null || true
+    log_info "1. 停止并移除服务..."
+    # 停止所有相关服务
+    for svc in $(systemctl list-units --full -all | grep "qbittorrent-nox@" | awk '{print $1}'); do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$svc"
+    done
     pkill -9 qbittorrent-nox 2>/dev/null || true
-    rm -f /etc/systemd/system/qbittorrent-nox@.service /usr/bin/qbittorrent-nox
+    rm -f /usr/bin/qbittorrent-nox
 
-    log_info "2. 清理 Docker 资源 (深度模式)..."
+    log_info "2. 清理 Docker 资源..."
     if command -v docker >/dev/null; then
-        # 停止特定容器
         docker rm -f vertex filebrowser 2>/dev/null || true
-        # 删除特定镜像
         docker rmi lswl/vertex:stable filebrowser/filebrowser:latest 2>/dev/null || true
-        # 清理未使用的网络
         docker network prune -f >/dev/null 2>&1 || true
-        
         if [[ "$mode" == "--purge" ]]; then
             log_warn "执行 Docker 系统级清理..."
             docker system prune -af --volumes >/dev/null 2>&1 || true
         fi
     fi
 
-    log_info "3. 移除系统优化配置..."
+    log_info "3. 移除系统优化..."
     systemctl stop asp-tune.service 2>/dev/null || true
     systemctl disable asp-tune.service 2>/dev/null || true
     rm -f /etc/systemd/system/asp-tune.service /usr/local/bin/asp-tune.sh /etc/sysctl.d/99-ptbox.conf
-    # 恢复 limits.conf
     if [ -f /etc/security/limits.conf ]; then
         sed -i '/# Auto-Seedbox-PT/d' /etc/security/limits.conf || true
     fi
@@ -153,22 +178,25 @@ uninstall() {
     sysctl --system >/dev/null 2>&1 || true
 
     if [[ "$mode" == "--purge" ]]; then
-        log_warn "4. 深度粉碎用户数据..."
-        rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
-        read -p "是否同步删除下载目录 /root/Downloads ? [y/n]: " del_dl < /dev/tty
-        if [[ "$del_dl" =~ ^[Yy]$ ]]; then rm -rf "/root/Downloads"; fi
+        log_warn "4. 尝试清理用户数据..."
+        read -p "是否删除相关的配置文件? (不会删除用户本身) [y/n]: " del_conf < /dev/tty
+        if [[ "$del_conf" =~ ^[Yy]$ ]]; then
+             rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser"
+             rm -rf "/home/*/.config/qBittorrent" "/home/*/vertex" "/home/*/.config/filebrowser"
+             log_info "配置文件已清除。"
+        fi
     fi
     
     log_info "卸载完成。"
     exit 0
 }
 
-# ================= 3. 系统全栈优化 (-t) =================
+# ================= 4. 智能系统优化 (增强版) =================
 
 optimize_system() {
-    print_banner "应用全栈系统优化 (ASP-Tuned)"
+    print_banner "应用智能系统优化 (ASP-Tuned)"
     
-    # 动态计算内存参数
+    # 动态内存计算 (更精确适配不同内存大小)
     local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local rmem_max=$((mem_kb * 1024 / 2)); [[ $rmem_max -gt 134217728 ]] && rmem_max=134217728
     local tcp_mem_min=$((mem_kb / 16)); local tcp_mem_def=$((mem_kb / 8)); local tcp_mem_max=$((mem_kb / 4))
@@ -207,34 +235,46 @@ root soft nofile 1048576
 EOF
     fi
 
-    # 3. 增强版开机启动脚本 (磁盘调度 + 网卡物理层优化)
+    # 3. 增强版开机启动脚本 (虚拟化检测 + 磁盘调度 + 网卡优化)
     cat > /usr/local/bin/asp-tune.sh << 'EOF_SCRIPT'
 #!/bin/bash
-# 磁盘调度器优化
+
+# 1. 虚拟化检测 (避免在虚拟机中无效设置调度器)
+IS_VIRT=$(systemd-detect-virt 2>/dev/null || echo "none")
+
+# 2. 磁盘 I/O 优化
 for disk in $(lsblk -nd --output NAME | grep -v '^md' | grep -v '^loop'); do
-    queue_path="/sys/block/$disk/queue"
-    if [ -f "$queue_path/scheduler" ]; then
-        rot=$(cat "$queue_path/rotational")
-        if [ "$rot" == "0" ]; then
-            # SSD 使用 mq-deadline
-            echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null || echo "none" > "$queue_path/scheduler" 2>/dev/null
-        else
-            # HDD 优先使用 bfq
-            echo "bfq" > "$queue_path/scheduler" 2>/dev/null || echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null
+    # 通用优化：预读 (Read-Ahead) - 对物理机和虚拟机都有效
+    blockdev --setra 4096 "/dev/$disk" 2>/dev/null
+
+    # 仅物理机调整调度器
+    if [[ "$IS_VIRT" == "none" ]]; then
+        queue_path="/sys/block/$disk/queue"
+        if [ -f "$queue_path/scheduler" ]; then
+            rot=$(cat "$queue_path/rotational")
+            if [ "$rot" == "0" ]; then
+                echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null || echo "none" > "$queue_path/scheduler" 2>/dev/null
+            else
+                echo "bfq" > "$queue_path/scheduler" 2>/dev/null || echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null
+            fi
         fi
-        # 预读优化
-        blockdev --setra 4096 "/dev/$disk" 2>/dev/null
     fi
 done
 
-# 网卡队列与 Ring Buffer 优化
+# 3. 网络物理层与路由优化
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 if [ -n "$ETH" ]; then
-    # 增加传输队列长度
+    # 增加传输队列
     ifconfig "$ETH" txqueuelen 10000 2>/dev/null
-    # 增加 Ring Buffer (接收/发送缓冲区)
+    # Ring Buffer (接收/发送缓冲区)
     ethtool -G "$ETH" rx 4096 tx 4096 2>/dev/null || true
-    ethtool -G "$ETH" rx 2048 tx 2048 2>/dev/null || true # 回退兼容
+    ethtool -G "$ETH" rx 2048 tx 2048 2>/dev/null || true 
+fi
+
+# 4. 拥塞窗口优化 (InitCWND) - 提升慢启动速度
+DEF_ROUTE=$(ip -o -4 route show to default | head -n1)
+if [[ -n "$DEF_ROUTE" ]]; then
+    ip route change $DEF_ROUTE initcwnd 25 initrwnd 25 2>/dev/null || true
 fi
 EOF_SCRIPT
     chmod +x /usr/local/bin/asp-tune.sh
@@ -252,14 +292,14 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
     systemctl start asp-tune.service || true
-    log_info "全栈系统优化 (内核+网络物理层) 已应用。"
+    log_info "智能系统优化 (内核+磁盘+网络) 已应用。"
 }
 
-# ================= 4. 应用部署逻辑 =================
+# ================= 5. 应用部署逻辑 =================
 
 install_qbit() {
     print_banner "部署 qBittorrent"
-    local hb="/root"; local arch=$(uname -m); local url=""
+    local arch=$(uname -m); local url=""
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
         [[ "$arch" == "x86_64" ]] && url="$URL_V4_AMD64" || url="$URL_V4_ARM64"
         INSTALLED_MAJOR_VER="4"
@@ -273,7 +313,9 @@ install_qbit() {
     
     download_file "$url" "/usr/bin/qbittorrent-nox"
     chmod +x /usr/bin/qbittorrent-nox
-    mkdir -p "$hb/.config/qBittorrent" "$hb/Downloads"
+    
+    mkdir -p "$HB/.config/qBittorrent" "$HB/Downloads"
+    chown -R "$APP_USER:$APP_USER" "$HB/.config/qBittorrent" "$HB/Downloads"
     
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
     local threads_val="4"; local cache_val="$QB_CACHE"
@@ -283,9 +325,9 @@ install_qbit() {
         if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then threads_val="16"; fi
     fi
 
-    cat > "$hb/.config/qBittorrent/qBittorrent.conf" << EOF
+    cat > "$HB/.config/qBittorrent/qBittorrent.conf" << EOF
 [BitTorrent]
-Session\DefaultSavePath=$hb/Downloads/
+Session\DefaultSavePath=$HB/Downloads/
 Session\AsyncIOThreadsCount=$threads_val
 [Preferences]
 Connection\PortRangeMin=$QB_BT_PORT
@@ -300,23 +342,24 @@ WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
 WebUI\HTTPS\Enabled=false
 EOF
+    chown "$APP_USER:$APP_USER" "$HB/.config/qBittorrent/qBittorrent.conf"
     
     cat > /etc/systemd/system/qbittorrent-nox@.service << EOF
 [Unit]
-Description=qBittorrent Service (Root)
+Description=qBittorrent Service (User: %i)
 After=network.target
 [Service]
 Type=simple
-User=root
-Group=root
+User=$APP_USER
+Group=$APP_USER
 ExecStart=/usr/bin/qbittorrent-nox --webui-port=$QB_WEB_PORT
 Restart=on-failure
 LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable "qbittorrent-nox@root" >/dev/null 2>&1
-    systemctl restart "qbittorrent-nox@root"
+    systemctl daemon-reload && systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
+    systemctl restart "qbittorrent-nox@$APP_USER"
     open_port "$QB_WEB_PORT"; open_port "$QB_BT_PORT" "tcp"; open_port "$QB_BT_PORT" "udp"
 }
 
@@ -324,7 +367,6 @@ install_apps() {
     print_banner "部署 Docker 及应用"
     wait_for_lock
     
-    # 使用官方安装脚本，保证最新稳定版
     if ! command -v docker >/dev/null; then
         log_info "使用官方脚本安装 Docker..."
         curl -fsSL https://get.docker.com -o get-docker.sh
@@ -335,13 +377,11 @@ install_apps() {
         rm -f get-docker.sh
     fi
 
-    local hb="/root"
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (Smart-Polling)"
         
-        # 1. 创建挂载点并放开权限 (交由容器内部初始化)
-        mkdir -p "$hb/vertex/data"
-        chmod 777 "$hb/vertex/data"
+        mkdir -p "$HB/vertex/data"
+        chmod 777 "$HB/vertex/data"
         
         docker rm -f vertex &>/dev/null || true
         
@@ -351,50 +391,38 @@ install_apps() {
             download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
             local unzip_cmd="unzip -o"
             [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
-            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$hb/vertex/\"" || true
+            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/\"" || true
             need_init=false
-        elif [[ -f "$hb/vertex/data/setting.json" ]]; then
+        elif [[ -f "$HB/vertex/data/setting.json" ]]; then
              log_info "检测到已有配置，跳过初始化等待..."
              need_init=false
         fi
 
-        # 2. 启动容器 (触发初始化)
+        # 启动容器
         log_info "启动 Vertex 容器..."
         docker run -d --name vertex \
             --restart unless-stopped \
             -p $VX_PORT:3000 \
-            -v "$hb/vertex":/vertex \
+            -v "$HB/vertex":/vertex \
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable
 
-        # 3. 轮询检测 + 智能修正
         if [[ "$need_init" == "true" ]]; then
             log_info "等待容器初始化目录结构..."
             local count=0
-            local max_retries=30
-            while [ ! -d "$hb/vertex/data/rule" ] && [ $count -lt $max_retries ]; do
+            while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 30 ]; do
                 echo -n "."
                 sleep 1
                 ((count++))
             done
             echo ""
-            
-            if [ ! -d "$hb/vertex/data/rule" ]; then
-                log_warn "初始化检测超时，可能容器启动较慢，尝试强制继续..."
-            else
-                log_info "目录结构初始化完成。"
-            fi
-            
-            log_info "暂停容器以注入用户配置..."
             docker stop vertex >/dev/null 2>&1 || true
         else
-            log_info "正在智能修正备份中的 qBittorrent 配置..."
+            log_info "智能修正备份中的下载器配置..."
             docker stop vertex >/dev/null 2>&1 || true
-            
-            # 智能修正：遍历客户端配置，更新为当前安装参数
             local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
-            if ls "$hb/vertex/data/client/"*.json 1> /dev/null 2>&1; then
-                for client in "$hb/vertex/data/client/"*.json; do
+            if ls "$HB/vertex/data/client/"*.json 1> /dev/null 2>&1; then
+                for client in "$HB/vertex/data/client/"*.json; do
                     if grep -q "qBittorrent" "$client"; then
                          jq --arg url "http://$gw:$QB_WEB_PORT" \
                             --arg user "$APP_USER" \
@@ -403,13 +431,12 @@ install_apps() {
                             "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
                     fi
                 done
-                log_info "已自动更新 Vertex 内的下载器连接信息。"
+                log_info "连接信息已修正。"
             fi
         fi
 
-        # 4. 注入面板登录配置
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
-        local set_file="$hb/vertex/data/setting.json"
+        local set_file="$HB/vertex/data/setting.json"
         
         if [[ -f "$set_file" ]]; then
             log_info "同步面板访问配置..."
@@ -425,8 +452,9 @@ install_apps() {
 }
 EOF
         fi
+        
+        chown "$APP_USER:$APP_USER" "$HB/vertex"
 
-        # 5. 最终重启
         log_info "重启 Vertex 服务..."
         docker start vertex
         open_port "$VX_PORT"
@@ -434,16 +462,19 @@ EOF
 
     if [[ "$DO_FB" == "true" ]]; then
         print_banner "部署 FileBrowser"
-        rm -rf "$hb/.config/filebrowser" "$hb/fb.db"; mkdir -p "$hb/.config/filebrowser" && touch "$hb/fb.db" && chmod 666 "$hb/fb.db"
+        rm -rf "$HB/.config/filebrowser" "$HB/fb.db"; mkdir -p "$HB/.config/filebrowser" && touch "$HB/fb.db" && chmod 666 "$HB/fb.db"
+        chown -R "$APP_USER:$APP_USER" "$HB/.config/filebrowser" "$HB/fb.db"
+
         docker rm -f filebrowser &>/dev/null || true
-        docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init
-        docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin
-        docker run -d --name filebrowser --restart unless-stopped --user 0:0 -v "$hb":/srv -v "$hb/fb.db":/database/filebrowser.db -v "$hb/.config/filebrowser":/config -p $FB_PORT:80 filebrowser/filebrowser:latest
+        docker run --rm --user 0:0 -v "$HB/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init
+        docker run --rm --user 0:0 -v "$HB/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin
+        
+        docker run -d --name filebrowser --restart unless-stopped --user 0:0 -v "$HB":/srv -v "$HB/fb.db":/database/filebrowser.db -v "$HB/.config/filebrowser":/config -p $FB_PORT:80 filebrowser/filebrowser:latest
         open_port "$FB_PORT"
     fi
 }
 
-# ================= 5. 入口主流程 =================
+# ================= 6. 入口主流程 =================
 
 case "${1:-}" in
     --uninstall) uninstall "";;
@@ -455,6 +486,7 @@ while getopts "u:p:c:q:vftod:k:" opt; do
 done
 
 check_root
+if [[ -z "$APP_USER" ]]; then APP_USER="admin"; fi
 if [[ -n "$APP_PASS" ]]; then validate_pass "$APP_PASS"; fi
 
 print_banner "环境初始化"
@@ -476,6 +508,7 @@ if [[ "$CUSTOM_PORT" == "true" ]]; then
     [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
 fi
 
+setup_user
 install_qbit
 [[ "$DO_VX" == "true" || "$DO_FB" == "true" ]] && install_apps
 [[ "$DO_TUNE" == "true" ]] && optimize_system
@@ -503,11 +536,11 @@ fi
 
 echo -e "${BLUE}--------------------------------------------------------${NC}"
 echo -e "🔐 ${GREEN}账号信息${NC}"
-echo -e "用户名: ${YELLOW}$APP_USER${NC}"
-echo -e "密  码: ${YELLOW}$APP_PASS${NC}"
-echo -e "BT 端口: ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP)"
+echo -e "系统用户: ${YELLOW}$APP_USER${NC}"
+echo -e "Web 密码: ${YELLOW}$APP_PASS${NC}"
+echo -e "BT 端口 : ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP)"
 echo -e "${BLUE}========================================================${NC}"
 
-[[ "$DO_TUNE" == "true" ]] && echo -e "${YELLOW}提示: 深度持久化优化已生效。${NC}"
+[[ "$DO_TUNE" == "true" ]] && echo -e "${YELLOW}提示: 智能系统优化已生效。${NC}"
 warn "建议重启系统以确保所有优化生效 (命令: reboot)"
 echo ""
