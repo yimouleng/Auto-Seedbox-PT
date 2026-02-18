@@ -243,71 +243,63 @@ install_apps() {
     local hb="/root"
 
     if [[ "$DO_VX" == "true" ]]; then
-        print_banner "正在部署 Vertex (Host模式)"
+        print_banner "正在部署 Vertex (Bridge模式)"
         mkdir -p "$hb/vertex/data"
         chmod -R 777 "$hb/vertex"
         
-        # 1. 彻底清理环境
+        # 1. 彻底清理
         docker rm -f vertex &>/dev/null || true
         
-        # 2. 【核心修复】首次启动：不预置文件，让Vertex自己生成完整的默认配置(端口3000)
-        log_info "步骤 1/3: 启动 Vertex 初始化默认配置..."
-        docker run -d --name vertex --network host \
+        # 2. 首次启动：Bridge 模式，映射端口
+        # 注意：这里我们使用 -p 映射，将外部 $VX_PORT 转发到容器内部 3000
+        # 这样就不需要修改容器内部配置文件的端口了，极其稳定
+        log_info "启动 Vertex 进行初始化..."
+        docker run -d --name vertex \
+            -p $VX_PORT:3000 \
             -v "$hb/vertex":/vertex \
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable >/dev/null
             
-        # 3. 【智能等待】通过检测 127.0.0.1:3000 通断来判断是否完全启动
-        log_info "步骤 2/3: 等待初始化完成..."
-        local wait_limit=60
-        local initialized=false
-        for ((i=1; i<=wait_limit; i++)); do
-            if curl -s -m 1 http://127.0.0.1:3000 >/dev/null; then
-                initialized=true
-                break
-            fi
-            sleep 1
-        done
+        # 3. 等待初始化生成文件 (防止 ENOENT)
+        log_info "等待初始化 (15s)..."
+        sleep 15
         
-        if [ "$initialized" = "false" ]; then
-            log_warn "Vertex 初始化超时，可能已启动但无法访问，尝试强行修改配置..."
-        else
-            log_info "Vertex 初始化成功，准备修改端口..."
-        fi
-        
-        # 4. 停止容器
+        # 4. 停止容器配置账号
         docker stop vertex >/dev/null
         
-        # 5. 【外科手术式修改】在完整文件上修改端口，这样 Vertex 再次启动时就不会重置了
-        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
-        local set_file="$hb/vertex/data/setting.json"
-        
-        # 恢复备份 (如果存在) - 备份会覆盖刚才生成的默认文件
+        # 恢复备份逻辑
         if [[ -n "$VX_RESTORE_URL" ]]; then
-            log_info "正在恢复备份数据..."
+            log_info "恢复备份数据..."
             wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
             if [[ -f "$TEMP_DIR/bk.zip" ]]; then
-                unzip -o ${VX_ZIP_PASS:+-P $VX_ZIP_PASS} "$TEMP_DIR/bk.zip" -d "$hb/vertex/" >/dev/null || log_warn "备份解压失败"
+                local unzip_cmd="unzip -o"
+                [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P $VX_ZIP_PASS"
+                $unzip_cmd "$TEMP_DIR/bk.zip" -d "$hb/vertex/" >/dev/null || log_warn "备份解压失败"
             fi
         fi
 
-        log_info "步骤 3/3: 注入自定义端口 ($VX_PORT)..."
-        # 无论是否恢复备份，都强制将端口和账号改为当前设定值
+        # 5. 注入账号密码 (仅修改 user/pass，绝对不碰端口)
+        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
+        local set_file="$hb/vertex/data/setting.json"
+        
+        log_info "配置 Vertex 账号..."
         if [ -f "$set_file" ]; then
-            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
-               '.username = $u | .password = $p | .port = $pt' \
+            # 文件已存在 (正常情况)
+            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
+               '.username = $u | .password = $p' \
                "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
         else
-            # 极少数情况文件依然不存在，兜底创建
+            # 兜底：如果没生成，手动创建一个只含账号密码的文件
+            # Vertex 启动时会合并默认配置 (默认监听3000)
             cat > "$set_file" << EOF
-{ "username": "$APP_USER", "password": "$vx_pass_md5", "port": $VX_PORT }
+{ "username": "$APP_USER", "password": "$vx_pass_md5" }
 EOF
         fi
         
         # 6. 最终重启
         docker start vertex >/dev/null
         open_port "$VX_PORT"
-        log_info "Vertex 部署完成，已监听端口: $VX_PORT"
+        log_info "Vertex 部署完成，端口映射: $VX_PORT -> 3000"
     fi
 
     if [[ "$DO_FB" == "true" ]]; then
@@ -327,7 +319,7 @@ EOF
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin >/dev/null
         
         log_info "启动服务..."
-        # 强制 Root 运行主进程 (解决 Permission Denied 的终极方案)
+        # 强制 Root 运行主进程
         docker run -d --name filebrowser --restart unless-stopped \
             --user 0:0 \
             -v "$hb":/srv \
@@ -410,8 +402,8 @@ echo -e "BT 端口 : ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP)"
 echo -e "${BLUE}--------------------------------------------------------${NC}"
 echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 if [[ "$DO_VX" == "true" ]]; then
-    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC} (Host模式)"
-    echo -e "   └─ 提示: 下载器地址请填 ${YELLOW}127.0.0.1:$QB_WEB_PORT${NC}"
+    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC} (Bridge模式)"
+    echo -e "   └─ 提示: 下载器地址请填 ${YELLOW}172.17.0.1:$QB_WEB_PORT${NC}"
     if [[ -n "$VX_RESTORE_URL" ]]; then echo -e "   └─ 状态: ${GREEN}数据已恢复${NC}"; fi
 fi
 if [[ "$DO_FB" == "true" ]]; then
