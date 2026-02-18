@@ -6,7 +6,7 @@
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
 #   -u : 用户名
-#   -p : 密码
+#   -p : 密码（必须 ≥ 8 位）
 #   -c : qBittorrent 缓存大小 (MiB)
 #   -q : qBittorrent 版本 (4.3.9)
 #   -v : 安装 Vertex
@@ -44,7 +44,6 @@ VX_RESTORE_URL=""
 VX_ZIP_PASS=""
 INSTALLED_MAJOR_VER="4"
 
-# 临时目录管理：使用专用前缀方便意外中断后的手动识别
 TEMP_DIR=$(mktemp -d -t asp-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -57,7 +56,6 @@ log_info() { echo -e "${GREEN}[INFO] $1${NC}" >&2; }
 log_warn() { echo -e "${YELLOW}[WARN] $1${NC}" >&2; }
 log_err() { echo -e "${RED}[ERROR] $1${NC}" >&2; exit 1; }
 
-# 增强版下载函数：带错误捕获
 download_file() {
     local url=$1
     local output=$2
@@ -77,6 +75,13 @@ check_root() {
     [[ $EUID -ne 0 ]] && log_err "权限不足：请使用 root 用户运行本脚本！"
 }
 
+# 密码安全性检查
+validate_pass() {
+    if [[ ${#1} -lt 8 ]]; then
+        log_err "密码安全性不足：长度必须大于或等于 8 位！当前长度为 ${#1}。"
+    fi
+}
+
 wait_for_lock() {
     local max_wait=300; local waited=0
     while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
@@ -88,7 +93,7 @@ wait_for_lock() {
 open_port() {
     local port=$1; local proto=${2:-tcp}
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$port/$proto" >/dev/null 2>&1 || log_warn "UFW 端口 $port 放行失败，请手动检查。"
+        ufw allow "$port/$proto" >/dev/null 2>&1 || log_warn "UFW 端口 $port 放行失败。"
     fi
 }
 
@@ -102,15 +107,15 @@ get_input_port() {
     done
 }
 
-# ================= 2. 卸载与清理 =================
+# ================= 2. 卸载逻辑 =================
 
 uninstall() {
     local mode=$1
     print_banner "执行卸载流程"
-    read -p "确认要卸载所有组件吗？此操作不可逆！ [y/n]: " confirm < /dev/tty
+    read -p "确认要卸载所有组件吗？ [y/n]: " confirm < /dev/tty
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
 
-    log_info "清理原生服务与二进制文件..."
+    log_info "清理原生服务..."
     systemctl stop "qbittorrent-nox@root" 2>/dev/null || true
     systemctl disable "qbittorrent-nox@root" 2>/dev/null || true
     rm -f /etc/systemd/system/qbittorrent-nox@.service /usr/bin/qbittorrent-nox
@@ -120,7 +125,7 @@ uninstall() {
         docker rm -f vertex filebrowser 2>/dev/null || true
     fi
 
-    log_info "还原系统优化设置..."
+    log_info "还原系统优化..."
     systemctl stop asp-tune.service 2>/dev/null || true
     systemctl disable asp-tune.service 2>/dev/null || true
     rm -f /etc/systemd/system/asp-tune.service /usr/local/bin/asp-tune.sh /etc/sysctl.d/99-ptbox.conf
@@ -128,16 +133,16 @@ uninstall() {
     sysctl --system || true
 
     if [[ "$mode" == "--purge" ]]; then
-        log_warn "正在抹除所有用户数据 (Purge Mode)..."
+        log_warn "深度清理用户配置..."
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
-        read -p "是否同步删除下载文件夹 /root/Downloads ? [y/n]: " del_dl < /dev/tty
-        [[ "$del_dl" =~ ^[Yy]$ ]] && rm -rf "/root/Downloads" && log_warn "下载数据已删除。"
+        read -p "是否同步删除下载目录 /root/Downloads ? [y/n]: " del_dl < /dev/tty
+        [[ "$del_dl" =~ ^[Yy]$ ]] && rm -rf "/root/Downloads"
     fi
-    log_info "所有组件已卸载。"
+    log_info "卸载完成。"
     exit 0
 }
 
-# ================= 3. 持久化系统优化 (-t) =================
+# ================= 3. 系统持久化优化 (-t) =================
 
 optimize_system() {
     print_banner "应用持久化系统优化"
@@ -164,7 +169,7 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 EOF
-    sysctl --system || log_warn "部分内核参数无法应用，这通常是因为内核版本过低或处于容器环境。"
+    sysctl --system || log_warn "部分内核参数无法应用。"
 
     cat > /usr/local/bin/asp-tune.sh << 'EOF_SCRIPT'
 #!/bin/bash
@@ -194,7 +199,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
-    systemctl start asp-tune.service || log_warn "优化服务启动异常，请检查 hardware/driver 兼容性。"
+    systemctl start asp-tune.service || log_warn "优化服务启动异常。"
 }
 
 # ================= 4. 应用部署逻辑 =================
@@ -259,7 +264,7 @@ EOF
 }
 
 install_apps() {
-    wait_for_lock; apt-get -qq install docker.io -y || log_err "Docker 核心组件安装失败，请检查 apt 源。"
+    wait_for_lock; apt-get -qq install docker.io -y || log_err "Docker 安装失败。"
     local hb="/root"
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (Smart-Polling 模式)"
@@ -268,7 +273,7 @@ install_apps() {
         log_info "启动 Vertex 容器..."
         docker run -d --name vertex -p $VX_PORT:3000 -v "$hb/vertex":/vertex -e TZ=Asia/Shanghai lswl/vertex:stable
         
-        log_info "正在监控内部结构生成..."
+        log_info "监控内部结构生成..."
         local wait_count=0
         while true; do
             if [[ -f "$hb/vertex/data/setting.json" ]] && [[ -d "$hb/vertex/data/rule" ]]; then
@@ -276,7 +281,7 @@ install_apps() {
                 break
             fi
             sleep 1; wait_count=$((wait_count+1))
-            [[ $wait_count -ge 60 ]] && log_warn "初始化超时，尝试强制注入配置。" && break
+            [[ $wait_count -ge 60 ]] && log_warn "初始化超时，强制继续。" && break
         done
         
         docker stop vertex || true
@@ -285,7 +290,7 @@ install_apps() {
             download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
             local unzip_cmd="unzip -o"
             [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
-            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$hb/vertex/\"" || log_warn "备份解压失败，请确认密码是否正确。"
+            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$hb/vertex/\"" || log_warn "备份解压失败。"
         fi
         
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
@@ -294,13 +299,13 @@ install_apps() {
             log_info "原子化写入配置..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
                '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
-               mv "${set_file}.tmp" "$set_file" || log_err "jq 处理配置文件失败，请检查系统资源。"
+               mv "${set_file}.tmp" "$set_file" || log_err "jq 处理配置文件失败。"
         else
             cat > "$set_file" << EOF
 { "username": "$APP_USER", "password": "$vx_pass_md5", "port": 3000 }
 EOF
         fi
-        docker start vertex || log_err "Vertex 容器启动失败，请使用 docker logs 查看原因。"
+        docker start vertex || log_err "Vertex 启动失败。"
         open_port "$VX_PORT"
     fi
 
@@ -327,10 +332,21 @@ while getopts "u:p:c:q:vftod:k:" opt; do
 done
 
 check_root
+# 如果通过参数传入了密码，立刻校验
+[[ -n "$APP_PASS" ]] && validate_pass "$APP_PASS"
+
 print_banner "环境预检"
 wait_for_lock; export DEBIAN_FRONTEND=noninteractive; apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool >/dev/null
 
-[[ -z "$APP_PASS" ]] && (echo -n "请输入 Web 面板统一密码 (需满足复杂度): "; read -s APP_PASS < /dev/tty; echo "")
+if [[ -z "$APP_PASS" ]]; then
+    while true; do
+        echo -n "请输入 Web 面板统一密码 (必须 ≥ 8 位): "
+        read -s APP_PASS < /dev/tty
+        echo ""
+        if [[ ${#APP_PASS} -ge 8 ]]; then break; fi
+        log_warn "密码过短，请重新输入！"
+    done
+fi
 
 if [[ "$CUSTOM_PORT" == "true" ]]; then
     echo -e "${BLUE}=======================================${NC}"
@@ -355,13 +371,11 @@ echo -e "BT 端口 : ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP)"
 echo -e "${BLUE}--------------------------------------------------------${NC}"
 echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 if [[ "$DO_VX" == "true" ]]; then
-    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC} (Bridge模式)"
+    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
     echo -e "   └─ 提示: 下载器地址请填 ${YELLOW}172.17.0.1:$QB_WEB_PORT${NC}"
 fi
 if [[ "$DO_FB" == "true" ]]; then
     echo -e "📁 FileBrowser: ${GREEN}http://$PUB_IP:$FB_PORT${NC}"
-    echo -e "   └─ 下载目录: ${YELLOW}Downloads${NC}"
 fi
 echo -e "${BLUE}========================================================${NC}"
-[[ "$DO_TUNE" == "true" ]] && echo -e "${YELLOW}提示: 深度内核优化已生效，建议执行 reboot 以获得最佳 I/O 调度表现。${NC}"
-echo -e "${RED}[注意] 外部访问失败请检查云服务商安全组 (防火墙) 配置！${NC}"
+[[ "$DO_TUNE" == "true" ]] && echo -e "${YELLOW}提示: 深度持久化优化已生效。${NC}"
