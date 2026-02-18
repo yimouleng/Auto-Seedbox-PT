@@ -57,8 +57,7 @@ log_warn() { echo -e "${YELLOW}[WARN] $1${NC}" >&2; }
 log_err() { echo -e "${RED}[ERROR] $1${NC}" >&2; exit 1; }
 
 download_file() {
-    local url=$1
-    local output=$2
+    local url=$1; local output=$2
     log_info "正在从网络获取资源: $(basename "$output")"
     if ! wget -q --show-progress --retry-connrefused --tries=3 --timeout=30 -O "$output" "$url"; then
         log_err "文件下载失败！请检查网络连接或链接是否有效。\nURL: $url"
@@ -71,11 +70,14 @@ print_banner() {
     echo -e "${BLUE}------------------------------------------------${NC}"
 }
 
+# 修正：使用标准的 if 结构，防止 EUID=0 时返回状态码 1 触发 set -e
 check_root() { 
-    [[ $EUID -ne 0 ]] && log_err "权限不足：请使用 root 用户运行本脚本！"
+    if [[ $EUID -ne 0 ]]; then
+        log_err "权限不足：请使用 root 用户运行本脚本！"
+    fi
 }
 
-# 密码安全性检查
+# 修正：密码安全性检查
 validate_pass() {
     if [[ ${#1} -lt 8 ]]; then
         log_err "密码安全性不足：长度必须大于或等于 8 位！当前长度为 ${#1}。"
@@ -84,16 +86,20 @@ validate_pass() {
 
 wait_for_lock() {
     local max_wait=300; local waited=0
+    log_info "检查系统软件包锁状态..."
     while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
         sleep 2; waited=$((waited + 2))
-        [[ $waited -ge $max_wait ]] && break
+        if [[ $waited -ge $max_wait ]]; then
+            log_warn "等待锁超时，尝试强制继续..."
+            break
+        fi
     done
 }
 
 open_port() {
     local port=$1; local proto=${2:-tcp}
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$port/$proto" >/dev/null 2>&1 || log_warn "UFW 端口 $port 放行失败。"
+        ufw allow "$port/$proto" >/dev/null 2>&1 || true
     fi
 }
 
@@ -102,7 +108,10 @@ get_input_port() {
     while true; do
         read -p "$prompt [默认 $default]: " port < /dev/tty
         port=${port:-$default}
-        [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]] && echo "$port" && return 0
+        if [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]]; then
+            echo "$port"
+            return 0
+        fi
         log_warn "输入无效，请输入 1-65535 之间的数字。"
     done
 }
@@ -113,7 +122,7 @@ uninstall() {
     local mode=$1
     print_banner "执行卸载流程"
     read -p "确认要卸载所有组件吗？ [y/n]: " confirm < /dev/tty
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
 
     log_info "清理原生服务..."
     systemctl stop "qbittorrent-nox@root" 2>/dev/null || true
@@ -136,7 +145,7 @@ uninstall() {
         log_warn "深度清理用户配置..."
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
         read -p "是否同步删除下载目录 /root/Downloads ? [y/n]: " del_dl < /dev/tty
-        [[ "$del_dl" =~ ^[Yy]$ ]] && rm -rf "/root/Downloads"
+        if [[ "$del_dl" =~ ^[Yy]$ ]]; then rm -rf "/root/Downloads"; fi
     fi
     log_info "卸载完成。"
     exit 0
@@ -169,7 +178,7 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 EOF
-    sysctl --system || log_warn "部分内核参数无法应用。"
+    sysctl --system || true
 
     cat > /usr/local/bin/asp-tune.sh << 'EOF_SCRIPT'
 #!/bin/bash
@@ -177,13 +186,19 @@ for disk in $(lsblk -nd --output NAME | grep -v '^md' | grep -v '^loop'); do
     queue_path="/sys/block/$disk/queue"
     if [ -f "$queue_path/scheduler" ]; then
         rot=$(cat "$queue_path/rotational")
-        [[ "$rot" == "0" ]] && (echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null || echo "none" > "$queue_path/scheduler" 2>/dev/null) \
-                           || (echo "bfq" > "$queue_path/scheduler" 2>/dev/null || echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null)
+        if [ "$rot" == "0" ]; then
+            echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null || echo "none" > "$queue_path/scheduler" 2>/dev/null
+        else
+            echo "bfq" > "$queue_path/scheduler" 2>/dev/null || echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null
+        fi
         blockdev --setra 4096 "/dev/$disk" 2>/dev/null
     fi
 done
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-[[ -n "$ETH" ]] && (ifconfig "$ETH" txqueuelen 10000 2>/dev/null; ethtool -G "$ETH" rx 4096 tx 4096 2>/dev/null || true)
+if [ -n "$ETH" ]; then
+    ifconfig "$ETH" txqueuelen 10000 2>/dev/null
+    ethtool -G "$ETH" rx 4096 tx 4096 2>/dev/null || true
+fi
 EOF_SCRIPT
     chmod +x /usr/local/bin/asp-tune.sh
 
@@ -199,7 +214,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
-    systemctl start asp-tune.service || log_warn "优化服务启动异常。"
+    systemctl start asp-tune.service || true
 }
 
 # ================= 4. 应用部署逻辑 =================
@@ -224,8 +239,11 @@ install_qbit() {
     
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
     local threads_val="4"; local cache_val="$QB_CACHE"
-    [[ "$INSTALLED_MAJOR_VER" == "5" ]] && (cache_val="-1"; threads_val="0") || \
-    ([[ -f "/sys/block/sda/queue/rotational" && "$(cat /sys/block/sda/queue/rotational)" == "0" ]] && threads_val="16")
+    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then cache_val="-1"; threads_val="0"
+    else
+        local root_disk=$(df /root | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
+        if [[ -f "/sys/block/$root_disk/queue/rotational" && "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]]; then threads_val="16"; fi
+    fi
 
     cat > "$hb/.config/qBittorrent/qBittorrent.conf" << EOF
 [BitTorrent]
@@ -281,7 +299,7 @@ install_apps() {
                 break
             fi
             sleep 1; wait_count=$((wait_count+1))
-            [[ $wait_count -ge 60 ]] && log_warn "初始化超时，强制继续。" && break
+            if [[ $wait_count -ge 60 ]]; then log_warn "初始化超时，强制继续。"; break; fi
         done
         
         docker stop vertex || true
@@ -290,22 +308,22 @@ install_apps() {
             download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
             local unzip_cmd="unzip -o"
             [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
-            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$hb/vertex/\"" || log_warn "备份解压失败。"
+            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$hb/vertex/\"" || true
         fi
         
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         if [[ -f "$set_file" ]]; then
-            log_info "原子化写入配置..."
+            log_info "写入 Vertex 配置..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
                '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
-               mv "${set_file}.tmp" "$set_file" || log_err "jq 处理配置文件失败。"
+               mv "${set_file}.tmp" "$set_file"
         else
             cat > "$set_file" << EOF
 { "username": "$APP_USER", "password": "$vx_pass_md5", "port": 3000 }
 EOF
         fi
-        docker start vertex || log_err "Vertex 启动失败。"
+        docker start vertex || true
         open_port "$VX_PORT"
     fi
 
@@ -322,6 +340,7 @@ EOF
 
 # ================= 5. 主流程控制 =================
 
+# 参数预判
 case "${1:-}" in
     --uninstall) uninstall "";;
     --purge) uninstall "--purge";;
@@ -332,17 +351,18 @@ while getopts "u:p:c:q:vftod:k:" opt; do
 done
 
 check_root
-# 如果通过参数传入了密码，立刻校验
-[[ -n "$APP_PASS" ]] && validate_pass "$APP_PASS"
+# 修正：避免 [[ -n ]] 直接在全局作用域触发 set -e
+if [[ -n "$APP_PASS" ]]; then
+    validate_pass "$APP_PASS"
+fi
 
-print_banner "环境预检"
+print_banner "系统初始化"
 wait_for_lock; export DEBIAN_FRONTEND=noninteractive; apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool >/dev/null
 
 if [[ -z "$APP_PASS" ]]; then
     while true; do
         echo -n "请输入 Web 面板统一密码 (必须 ≥ 8 位): "
-        read -s APP_PASS < /dev/tty
-        echo ""
+        read -s APP_PASS < /dev/tty; echo ""
         if [[ ${#APP_PASS} -ge 8 ]]; then break; fi
         log_warn "密码过短，请重新输入！"
     done
@@ -351,13 +371,13 @@ fi
 if [[ "$CUSTOM_PORT" == "true" ]]; then
     echo -e "${BLUE}=======================================${NC}"
     QB_WEB_PORT=$(get_input_port "qBit WebUI" 8080); QB_BT_PORT=$(get_input_port "qBit BT监听" 20000)
-    [[ "$DO_VX" == "true" ]] && VX_PORT=$(get_input_port "Vertex" 3000)
-    [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
+    if [[ "$DO_VX" == "true" ]]; then VX_PORT=$(get_input_port "Vertex" 3000); fi
+    if [[ "$DO_FB" == "true" ]]; then FB_PORT=$(get_input_port "FileBrowser" 8081); fi
 fi
 
 install_qbit
-[[ "$DO_VX" == "true" || "$DO_FB" == "true" ]] && install_apps
-[[ "$DO_TUNE" == "true" ]] && optimize_system
+if [[ "$DO_VX" == "true" || "$DO_FB" == "true" ]]; then install_apps; fi
+if [[ "$DO_TUNE" == "true" ]]; then optimize_system; fi
 
 PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "ServerIP")
 
