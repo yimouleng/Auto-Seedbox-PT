@@ -103,6 +103,7 @@ uninstall() {
     echo -e "${YELLOW}      Auto-Seedbox-PT 卸载程序          ${NC}"
     echo -e "${YELLOW}========================================${NC}"
     
+    # 第一次确认：是否卸载
     read -p "警告：将停止服务并删除配置。确定继续吗？[y/N]: " confirm < /dev/tty
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
     
@@ -123,12 +124,15 @@ uninstall() {
         log_warn "正在执行深度清理 (配置与数据库)..."
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
         
+        # 第二次确认：是否删库 (修正为只输 Y)
         echo -e "${RED}是否删除下载目录 (/root/Downloads)? 数据无价，请慎重！${NC}"
-        read -p "输入 'yes' 确认删除: " del_dl < /dev/tty
+        read -p "确认删除吗？[y/N]: " del_dl < /dev/tty
         
-        if [[ "$del_dl" == "yes" ]]; then
+        if [[ "$del_dl" =~ ^[Yy]$ ]]; then
             rm -rf "/root/Downloads"
             log_warn "下载目录已删除。"
+        else
+            log_info "保留下载目录。"
         fi
     fi
     log_info "卸载完成。"
@@ -186,6 +190,7 @@ install_qbit() {
     
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
 
+    # 线程与缓存优化
     local threads_val="4"; local cache_val="$QB_CACHE"
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
         log_info "应用 v5 优化: 禁用应用层缓存 (DiskWriteCacheSize=-1)"
@@ -245,9 +250,8 @@ install_apps() {
         chmod -R 777 "$hb/vertex"
         docker rm -f vertex &>/dev/null || true
         
-        # 1. 首次启动 (Host模式) - 让 Vertex 自动生成目录和默认配置
-        # 注意：这里我们不尝试修改端口，让它先跑起来生成文件
-        log_info "启动 Vertex 进行初始化 (Host模式)..."
+        # 1. 首次启动 (Host模式) - 让 Vertex 自动生成目录
+        log_info "启动 Vertex 进行初始化..."
         docker run -d --name vertex --network host \
             -v "$hb/vertex":/vertex \
             -e TZ=Asia/Shanghai \
@@ -265,28 +269,25 @@ install_apps() {
             fi
         done
         
-        # 3. 停止容器进行配置
+        # 3. 停止容器配置
         docker stop vertex >/dev/null
         
-        # 4. 写入配置 (jq 精准修改内部端口)
-        # 关键点：在 Host 模式下，必须修改 setting.json 的 port 字段，Vertex 才会监听新端口
+        # 4. 写入配置 (jq)
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         
-        log_info "配置 Vertex 端口为: $VX_PORT"
+        log_info "配置 Vertex 端口 ($VX_PORT)..."
         if [ -f "$set_file" ]; then
-            # 使用 jq 修改存在的配置
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
                '.username = $u | .password = $p | .port = $pt' \
                "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
         else
-            # 兜底：如果还没生成，手动创建
             cat > "$set_file" << EOF
 { "username": "$APP_USER", "password": "$vx_pass_md5", "port": $VX_PORT }
 EOF
         fi
         
-        # 5. 恢复备份 (如果存在)
+        # 5. 恢复备份
         if [[ -n "$VX_RESTORE_URL" ]]; then
             log_info "恢复备份数据..."
             wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
@@ -295,15 +296,13 @@ EOF
                 [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P $VX_ZIP_PASS"
                 $unzip_cmd "$TEMP_DIR/bk.zip" -d "$hb/vertex/" >/dev/null || log_warn "备份解压失败"
                 
-                # 恢复后再次强制修改端口，防止被备份文件的设置覆盖
+                # 恢复后再次强制修改端口
                 jq --argjson pt "$VX_PORT" '.port = $pt' "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
             fi
         fi
         
-        # 6. 重启容器
+        # 6. 重启
         docker start vertex >/dev/null
-        
-        # 7. 确保防火墙放行用户指定的 Vertex 端口
         open_port "$VX_PORT"
     fi
 
@@ -319,12 +318,10 @@ EOF
         docker rm -f filebrowser &>/dev/null || true
         log_info "初始化数据库..."
         
-        # 强制 Root 运行初始化
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init >/dev/null
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin >/dev/null
         
         log_info "启动服务..."
-        # 强制 Root 运行主进程
         docker run -d --name filebrowser --restart unless-stopped \
             --user 0:0 \
             -v "$hb":/srv \
@@ -332,7 +329,6 @@ EOF
             -v "$hb/.config/filebrowser":/config \
             -p $FB_PORT:80 \
             filebrowser/filebrowser:latest >/dev/null
-            
         open_port "$FB_PORT"
     fi
 }
@@ -375,6 +371,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool >/dev/null
 
 if [[ -z "$APP_PASS" ]]; then
+    # 强制从终端读取密码
     echo -n "请输入 Web 面板密码 (至少12位): "
     read -s APP_PASS < /dev/tty
     echo ""
