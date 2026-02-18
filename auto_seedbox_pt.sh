@@ -27,13 +27,11 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 NC='\033[0m' # No Color
 
-# 默认端口
 QB_WEB_PORT=8080
 QB_BT_PORT=20000
 VX_PORT=3000
 FB_PORT=8081
 
-# 参数默认值
 APP_USER="admin"
 APP_PASS=""
 QB_CACHE=1024
@@ -48,7 +46,6 @@ INSTALLED_MAJOR_VER="4"
 
 TEMP_DIR=$(mktemp -d); trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# 下载源
 URL_V4_AMD64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent-4.3.9/x86_64/qBittorrent-4.3.9%20-%20libtorrent-v1.2.20/qbittorrent-nox"
 URL_V4_ARM64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent-4.3.9/ARM64/qBittorrent-4.3.9%20-%20libtorrent-v1.2.20/qbittorrent-nox"
 
@@ -96,7 +93,104 @@ get_input_port() {
     done
 }
 
-# ================= 2. 安装与配置逻辑 =================
+# ================= 2. 深度系统优化 (-t) =================
+
+optimize_system() {
+    print_banner "执行深度系统优化"
+    
+    # 1. 提升文件描述符限制
+    log_info "提升文件描述符限制..."
+    if ! grep -q "## PTBox Limits" /etc/security/limits.conf; then
+        cat >> /etc/security/limits.conf << EOF
+## PTBox Limits
+root hard nofile 1048576
+root soft nofile 1048576
+* hard nofile 1048576
+* soft nofile 1048576
+EOF
+    fi
+
+    # 2. 磁盘调度器自适应优化
+    log_info "优化磁盘调度器..."
+    for disk in $(lsblk -nd --output NAME | grep -v '^md'); do
+        local queue_path="/sys/block/$disk/queue"
+        if [ -f "$queue_path/scheduler" ]; then
+            local rot=$(cat "$queue_path/rotational")
+            if [ "$rot" == "0" ]; then
+                # SSD: 使用 none 或 mq-deadline
+                echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null || echo "none" > "$queue_path/scheduler" 2>/dev/null || true
+                log_info "  Disk $disk (SSD) -> mq-deadline/none"
+            else
+                # HDD: 使用 bfq (更适合 PT 的高并发随机读写)
+                echo "bfq" > "$queue_path/scheduler" 2>/dev/null || true
+                log_info "  Disk $disk (HDD) -> bfq"
+            fi
+        fi
+    done
+
+    # 3. 网卡队列与缓冲区优化
+    log_info "优化网卡参数..."
+    local interface=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+    if [ -n "$interface" ]; then
+        ifconfig "$interface" txqueuelen 10000 2>/dev/null || true
+        ethtool -G "$interface" rx 4096 tx 4096 2>/dev/null || true
+        log_info "  Interface $interface: txqueuelen=10000, RingBuffer=MAX"
+    fi
+
+    # 4. 根据内存动态计算 TCP 参数
+    log_info "计算内核 TCP 参数..."
+    local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local mem_bytes=$((mem_kb * 1024))
+    
+    # 动态计算 tcp_mem (页单位)
+    local tcp_mem_min=$((mem_kb / 16))
+    local tcp_mem_def=$((mem_kb / 8))
+    local tcp_mem_max=$((mem_kb / 4))
+    
+    # 动态计算 rmem/wmem (字节)
+    local rmem_max=$((mem_bytes / 2)) # 最大允许一半内存用于接收缓冲
+    [[ $rmem_max -gt 134217728 ]] && rmem_max=134217728 # 上限 128MB
+    local wmem_max=$rmem_max
+
+    cat > /etc/sysctl.d/99-ptbox.conf << EOF
+# --- 文件系统 ---
+fs.file-max = 1048576
+fs.nr_open = 1048576
+
+# --- 虚拟内存 (针对 PT 优化) ---
+vm.swappiness = 10
+vm.dirty_ratio = 60
+vm.dirty_background_ratio = 2
+vm.vfs_cache_pressure = 50
+
+# --- 网络核心 ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.rmem_max = $rmem_max
+net.core.wmem_max = $wmem_max
+
+# --- TCP 协议栈动态参数 ---
+net.ipv4.tcp_mem = $tcp_mem_min $tcp_mem_def $tcp_mem_max
+net.ipv4.tcp_rmem = 4096 87380 $rmem_max
+net.ipv4.tcp_wmem = 4096 65536 $wmem_max
+
+# --- TCP 连接优化 ---
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.ip_local_port_range = 1024 65535
+EOF
+    sysctl --system >/dev/null 2>&1
+}
+
+# ================= 3. 安装与配置逻辑 =================
 
 uninstall() {
     echo -e "${YELLOW}========================================${NC}"
@@ -117,6 +211,7 @@ uninstall() {
         docker rm -f vertex filebrowser 2>/dev/null || true
     fi
     rm -f /etc/sysctl.d/99-ptbox.conf
+    # 恢复默认调度器比较麻烦，这里不做回滚，重启后可能保留
     sysctl --system >/dev/null 2>&1
 
     if [[ "${1:-}" == "--purge" ]]; then
@@ -252,27 +347,45 @@ install_apps() {
         
         # 2. 首次启动：Bridge 模式，映射端口
         log_info "启动 Vertex 进行初始化..."
-        # 关键: -p $VX_PORT:3000 表示将用户端口映射到容器内部固定的3000
         docker run -d --name vertex \
             -p $VX_PORT:3000 \
             -v "$hb/vertex":/vertex \
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable >/dev/null
             
-        # 3. 智能等待配置生成 (替代 sleep 15)
-        log_info "等待初始化完成..."
-        local wait_count=0
-        while [ ! -f "$hb/vertex/data/setting.json" ]; do
-            sleep 1
-            wait_count=$((wait_count+1))
-            if [ $wait_count -ge 30 ]; then
-                log_warn "初始化耗时较长，继续尝试..."
+        # 3. 智能检测：配置生成 + 目录结构
+        log_info "智能检测初始化进度..."
+        local max_wait=120
+        local interval=1
+        local elapsed=0
+        
+        while true; do
+            # 检查 setting.json 是否存在
+            if [ -f "$hb/vertex/data/setting.json" ]; then
+                # 检查关键子目录是否已生成 (防止 ENOENT)
+                if [ -d "$hb/vertex/data/rule" ]; then
+                    log_info "检测到完整配置和目录结构。"
+                    break
+                fi
+            fi
+            
+            sleep $interval
+            elapsed=$((elapsed + interval))
+            
+            # 超时机制
+            if [ $elapsed -ge $max_wait ]; then
+                log_warn "初始化超时 (超过 ${max_wait}s)，将强制继续..."
                 break
             fi
         done
         
         # 4. 停止容器配置账号
         docker stop vertex >/dev/null
+        
+        # 5. 【兜底补全】手动创建可能缺失的关键目录 (双重保险)
+        mkdir -p "$hb/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
+        mkdir -p "$hb/vertex/data/rule/"{rss,link,race,delete}
+        chmod -R 777 "$hb/vertex/data"
         
         # 恢复备份逻辑
         if [[ -n "$VX_RESTORE_URL" ]]; then
@@ -285,36 +398,32 @@ install_apps() {
             fi
         fi
 
-        # 5. 注入配置
-        # 关键逻辑：强制将内部端口配置为 3000
-        # 原因：Docker Bridge 模式转发流量到容器的 3000 端口，如果 Vertex 监听别的端口(比如备份里的4000)，连接就会断开。
+        # 6. 注入配置
+        # 关键逻辑：强制将内部端口配置为 3000 (因为 Bridge 映射了 $VX_PORT:3000)
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         
         log_info "配置 Vertex (账号注入 + 端口锁定3000)..."
         if [ -f "$set_file" ]; then
-            # 文件已存在: 修改账号密码，并强制重置 port 为 3000
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
                '.username = $u | .password = $p | .port = 3000' \
                "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
         else
-            # 兜底创建
             cat > "$set_file" << EOF
 { "username": "$APP_USER", "password": "$vx_pass_md5", "port": 3000 }
 EOF
         fi
         
-        # 6. 最终重启
+        # 7. 最终重启
         docker start vertex >/dev/null
         open_port "$VX_PORT"
-        log_info "Vertex 部署完成，外部端口: $VX_PORT -> 内部端口: 3000"
+        log_info "Vertex 部署完成，映射: $VX_PORT -> 3000"
     fi
 
     if [[ "$DO_FB" == "true" ]]; then
         print_banner "正在部署 FileBrowser"
         rm -rf "$hb/.config/filebrowser" "$hb/fb.db"
         
-        # 创建数据库文件并赋予写权限
         mkdir -p "$hb/.config/filebrowser" 
         touch "$hb/fb.db"
         chmod 666 "$hb/fb.db"
@@ -322,12 +431,10 @@ EOF
         docker rm -f filebrowser &>/dev/null || true
         log_info "初始化数据库..."
         
-        # 强制 Root 运行初始化
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init >/dev/null
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin >/dev/null
         
         log_info "启动服务..."
-        # 强制 Root 运行主进程
         docker run -d --name filebrowser --restart unless-stopped \
             --user 0:0 \
             -v "$hb":/srv \
@@ -338,24 +445,6 @@ EOF
             
         open_port "$FB_PORT"
     fi
-}
-
-sys_tune() {
-    print_banner "应用系统优化 (BBR+FQ)"
-    [ ! -f /etc/sysctl.conf.bak ] && cp /etc/sysctl.conf /etc/sysctl.conf.bak
-    cat > /etc/sysctl.d/99-ptbox.conf << EOF
-fs.file-max=1048576
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.core.somaxconn=65535
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-net.ipv4.tcp_window_scaling=1
-EOF
-    sysctl --system >/dev/null 2>&1
-    local eth=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-    [[ -n "$eth" ]] && ifconfig "$eth" txqueuelen 10000 2>/dev/null || true
-    log_info "内核参数与网卡队列优化已应用。"
 }
 
 # ================= 3. 主流程 =================
@@ -396,7 +485,7 @@ fi
 
 install_qbit
 [[ "$DO_VX" == "true" || "$DO_FB" == "true" ]] && install_apps
-[[ "$DO_TUNE" == "true" ]] && sys_tune
+[[ "$DO_TUNE" == "true" ]] && optimize_system
 
 PUB_IP=$(curl -s --max-time 3 https://api.ipify.org || echo "ServerIP")
 
