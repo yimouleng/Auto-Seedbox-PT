@@ -103,7 +103,6 @@ uninstall() {
     echo -e "${YELLOW}      Auto-Seedbox-PT 卸载程序          ${NC}"
     echo -e "${YELLOW}========================================${NC}"
     
-    # 第一次确认：是否卸载
     read -p "警告：将停止服务并删除配置。确定继续吗？[y/N]: " confirm < /dev/tty
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
     
@@ -124,7 +123,6 @@ uninstall() {
         log_warn "正在执行深度清理 (配置与数据库)..."
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
         
-        # 第二次确认：是否删库 (修正为只输 Y)
         echo -e "${RED}是否删除下载目录 (/root/Downloads)? 数据无价，请慎重！${NC}"
         read -p "确认删除吗？[y/N]: " del_dl < /dev/tty
         
@@ -246,48 +244,30 @@ install_apps() {
 
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "正在部署 Vertex (Host模式)"
-        mkdir -p "$hb/vertex/data"
-        chmod -R 777 "$hb/vertex"
+        
+        # 1. 预先创建所有必要的目录结构 (确保 Vertex 启动时不报错)
+        log_info "预创建数据目录结构..."
+        mkdir -p "$hb/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
+        mkdir -p "$hb/vertex/data/rule/"{rss,link,race}
+        chmod -R 777 "$hb/vertex/data"
+        
+        # 2. 清理旧环境
         docker rm -f vertex &>/dev/null || true
         
-        # 1. 首次启动 (Host模式) - 让 Vertex 自动生成目录
-        log_info "启动 Vertex 进行初始化..."
-        docker run -d --name vertex --network host \
-            -v "$hb/vertex":/vertex \
-            -e TZ=Asia/Shanghai \
-            lswl/vertex:stable >/dev/null
-            
-        # 2. 智能等待：检测 setting.json 是否生成 (最多等 30秒)
-        log_info "等待初始化配置生成..."
-        local wait_count=0
-        while [ ! -f "$hb/vertex/data/setting.json" ]; do
-            sleep 1
-            wait_count=$((wait_count+1))
-            if [ $wait_count -ge 30 ]; then
-                log_warn "初始化超时，Vertex 可能启动失败。"
-                break
-            fi
-        done
-        
-        # 3. 停止容器配置
-        docker stop vertex >/dev/null
-        
-        # 4. 写入配置 (jq)
+        # 3. 预先生成 setting.json (Host模式下唯一可靠的改端口方法)
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         
-        log_info "配置 Vertex 端口 ($VX_PORT)..."
-        if [ -f "$set_file" ]; then
-            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
-               '.username = $u | .password = $p | .port = $pt' \
-               "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
-        else
-            cat > "$set_file" << EOF
-{ "username": "$APP_USER", "password": "$vx_pass_md5", "port": $VX_PORT }
+        log_info "注入 Vertex 配置 (监听端口: $VX_PORT)..."
+        cat > "$set_file" << EOF
+{
+  "username": "$APP_USER",
+  "password": "$vx_pass_md5",
+  "port": $VX_PORT
+}
 EOF
-        fi
-        
-        # 5. 恢复备份
+
+        # 4. 如果有备份，恢复备份
         if [[ -n "$VX_RESTORE_URL" ]]; then
             log_info "恢复备份数据..."
             wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
@@ -296,13 +276,24 @@ EOF
                 [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P $VX_ZIP_PASS"
                 $unzip_cmd "$TEMP_DIR/bk.zip" -d "$hb/vertex/" >/dev/null || log_warn "备份解压失败"
                 
-                # 恢复后再次强制修改端口
-                jq --argjson pt "$VX_PORT" '.port = $pt' "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
+                # 恢复后再次强制修改端口 (因为备份里包含的是旧端口配置)
+                log_info "修正备份中的端口设置..."
+                if [ -f "$set_file" ]; then
+                    jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
+                       '.username = $u | .password = $p | .port = $pt' \
+                       "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
+                fi
             fi
         fi
-        
-        # 6. 重启
-        docker start vertex >/dev/null
+
+        # 5. 启动容器 (Vertex 会读取我们预设好的文件，直接监听新端口)
+        log_info "启动 Vertex..."
+        docker run -d --name vertex --network host \
+            -v "$hb/vertex":/vertex \
+            -e TZ=Asia/Shanghai \
+            lswl/vertex:stable >/dev/null
+            
+        # 6. 放行端口
         open_port "$VX_PORT"
     fi
 
@@ -318,10 +309,12 @@ EOF
         docker rm -f filebrowser &>/dev/null || true
         log_info "初始化数据库..."
         
+        # 强制 Root 运行初始化
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init >/dev/null
         docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin >/dev/null
         
         log_info "启动服务..."
+        # 强制 Root 运行主进程 (解决 Permission Denied 的终极方案)
         docker run -d --name filebrowser --restart unless-stopped \
             --user 0:0 \
             -v "$hb":/srv \
@@ -329,6 +322,7 @@ EOF
             -v "$hb/.config/filebrowser":/config \
             -p $FB_PORT:80 \
             filebrowser/filebrowser:latest >/dev/null
+            
         open_port "$FB_PORT"
     fi
 }
