@@ -199,10 +199,10 @@ uninstall() {
     print_banner "执行深度卸载流程"
     
     if [[ "$mode" == "--purge" ]]; then
-        read -p "请输入当初安装时的用户名 (默认为 admin，root 请填 root): " target_user < /dev/tty
-        target_user=${target_user:-admin}
+        # [修改] 移除交互式输入，直接使用脚本变量或默认为 admin
+        target_user=${APP_USER:-admin}
         target_home=$(eval echo ~$target_user 2>/dev/null || echo "/home/$target_user")
-        log_warn "将清理用户 $target_user 位于 $target_home 下的配置文件。"
+        log_warn "自动清理用户 $target_user 位于 $target_home 下的配置文件。"
     fi
 
     read -p "确认要卸载所有组件吗？此操作不可逆！ [y/n]: " confirm < /dev/tty
@@ -467,7 +467,8 @@ install_apps() {
             while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 30 ]; do
                 echo -n "."
                 sleep 1
-                ((count++))
+                # [修改] 使用标准算术运算，防止在 set -e 下因结果为 0 导致退出
+                count=$((count + 1))
             done
             echo ""
             docker stop vertex >/dev/null 2>&1 || true
@@ -475,8 +476,12 @@ install_apps() {
             log_info "智能修正备份中的下载器配置..."
             docker stop vertex >/dev/null 2>&1 || true
             local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
-            if ls "$HB/vertex/data/client/"*.json 1> /dev/null 2>&1; then
-                for client in "$HB/vertex/data/client/"*.json; do
+            
+            # [修改] 开启 nullglob 避免没有文件时报错导致 set -e 退出
+            shopt -s nullglob
+            local client_files=("$HB/vertex/data/client/"*.json)
+            if [ ${#client_files[@]} -gt 0 ]; then
+                for client in "${client_files[@]}"; do
                     if grep -q "qBittorrent" "$client"; then
                          jq --arg url "http://$gw:$QB_WEB_PORT" \
                             --arg user "$APP_USER" \
@@ -487,6 +492,7 @@ install_apps() {
                 done
                 log_info "连接信息已修正。"
             fi
+            shopt -u nullglob
         fi
 
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
@@ -573,7 +579,7 @@ PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "ServerIP")
 
 echo ""
 echo -e "${GREEN}########################################################${NC}"
-echo -e "${GREEN}           Auto-Seedbox-PT 安装成功!                    ${NC}"
+echo -e "${GREEN}            Auto-Seedbox-PT 安装成功!                     ${NC}"
 echo -e "${GREEN}########################################################${NC}"
 
 echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
@@ -581,7 +587,7 @@ echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 if [[ "$DO_VX" == "true" ]]; then
     VX_IN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vertex 2>/dev/null || echo "Unknown")
     VX_GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
-    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
+    echo -e "🌐 Vertex:       ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
     echo -e "    └─ Docker 内网: ${BLUE}$VX_IN_IP:3000${NC}"
     echo -e "    └─ 内网连接qBit: ${YELLOW}$VX_GW:$QB_WEB_PORT${NC}"
 fi
