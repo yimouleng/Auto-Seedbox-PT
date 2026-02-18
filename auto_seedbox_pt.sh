@@ -112,85 +112,121 @@ get_input_port() {
     done
 }
 
-# ================= 2. 卸载逻辑 =================
+# ================= 2. 深度卸载逻辑 =================
 
 uninstall() {
     local mode=$1
-    print_banner "执行卸载流程"
-    read -p "确认要卸载所有组件吗？ [y/n]: " confirm < /dev/tty
+    print_banner "执行深度卸载流程"
+    read -p "确认要卸载所有组件吗？此操作不可逆！ [y/n]: " confirm < /dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
 
-    log_info "正在停止原生服务..."
+    log_info "1. 停止并移除原生服务..."
     systemctl stop "qbittorrent-nox@root" 2>/dev/null || true
     systemctl disable "qbittorrent-nox@root" 2>/dev/null || true
     pkill -9 qbittorrent-nox 2>/dev/null || true
     rm -f /etc/systemd/system/qbittorrent-nox@.service /usr/bin/qbittorrent-nox
 
-    log_info "正在移除 Docker 容器..."
+    log_info "2. 清理 Docker 容器与镜像..."
     if command -v docker >/dev/null; then
+        # 停止并删除指定容器
         docker rm -f vertex filebrowser 2>/dev/null || true
+        # 删除相关镜像 (可选，防止误删其他，这里只删特定镜像)
+        docker rmi lswl/vertex:stable filebrowser/filebrowser:latest 2>/dev/null || true
+        # 清理悬空网络和卷 (深度清理)
+        docker network prune -f >/dev/null 2>&1 || true
     fi
 
-    log_info "正在恢复系统环境..."
+    log_info "3. 移除系统优化配置..."
     systemctl stop asp-tune.service 2>/dev/null || true
     systemctl disable asp-tune.service 2>/dev/null || true
     rm -f /etc/systemd/system/asp-tune.service /usr/local/bin/asp-tune.sh /etc/sysctl.d/99-ptbox.conf
+    # 恢复 limits.conf
+    if [ -f /etc/security/limits.conf ]; then
+        sed -i '/# Auto-Seedbox-PT/d' /etc/security/limits.conf || true
+    fi
     systemctl daemon-reload
-    sysctl --system || true
+    sysctl --system >/dev/null 2>&1 || true
 
     if [[ "$mode" == "--purge" ]]; then
-        log_warn "深度清理用户数据..."
+        log_warn "4. 深度粉碎用户数据..."
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
         read -p "是否同步删除下载目录 /root/Downloads ? [y/n]: " del_dl < /dev/tty
         if [[ "$del_dl" =~ ^[Yy]$ ]]; then rm -rf "/root/Downloads"; fi
     fi
-    log_info "卸载完成。"
+    
+    log_info "卸载完成。建议重启服务器。"
     exit 0
 }
 
-# ================= 3. 系统持久化优化 (-t) =================
+# ================= 3. 智能系统优化 (-t) =================
 
 optimize_system() {
-    print_banner "应用持久化系统优化"
+    print_banner "应用高性能系统优化 (ASP-Tuned)"
+    
+    # 动态计算内存参数
     local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local rmem_max=$((mem_kb * 1024 / 2)); [[ $rmem_max -gt 134217728 ]] && rmem_max=134217728
     local tcp_mem_min=$((mem_kb / 16)); local tcp_mem_def=$((mem_kb / 8)); local tcp_mem_max=$((mem_kb / 4))
 
+    # 1. 写入 Sysctl 优化
     cat > /etc/sysctl.d/99-ptbox.conf << EOF
+# 文件系统限制
 fs.file-max = 1048576
 fs.nr_open = 1048576
+# 虚拟内存策略
 vm.swappiness = 10
 vm.dirty_ratio = 60
 vm.dirty_background_ratio = 2
+# 网络核心
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
+# TCP 缓冲区 (动态计算)
 net.core.rmem_max = $rmem_max
 net.core.wmem_max = $rmem_max
 net.ipv4.tcp_rmem = 4096 87380 $rmem_max
 net.ipv4.tcp_wmem = 4096 65536 $rmem_max
 net.ipv4.tcp_mem = $tcp_mem_min $tcp_mem_def $tcp_mem_max
+# TCP 协议栈优化
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
+net.ipv4.tcp_low_latency = 1
 EOF
-    sysctl --system || true
+    sysctl --system >/dev/null 2>&1 || true
 
+    # 2. 优化文件句柄限制 
+    if ! grep -q "Auto-Seedbox-PT" /etc/security/limits.conf; then
+        cat >> /etc/security/limits.conf << EOF
+# Auto-Seedbox-PT Limits
+* hard nofile 1048576
+* soft nofile 1048576
+root hard nofile 1048576
+root soft nofile 1048576
+EOF
+    fi
+
+    # 3. 创建原生 Systemd 调优服务 
     cat > /usr/local/bin/asp-tune.sh << 'EOF_SCRIPT'
 #!/bin/bash
+# 磁盘调度器优化
 for disk in $(lsblk -nd --output NAME | grep -v '^md' | grep -v '^loop'); do
     queue_path="/sys/block/$disk/queue"
     if [ -f "$queue_path/scheduler" ]; then
         rot=$(cat "$queue_path/rotational")
         if [ "$rot" == "0" ]; then
+            # SSD 使用 mq-deadline
             echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null || echo "none" > "$queue_path/scheduler" 2>/dev/null
         else
+            # HDD 优先使用 bfq
             echo "bfq" > "$queue_path/scheduler" 2>/dev/null || echo "mq-deadline" > "$queue_path/scheduler" 2>/dev/null
         fi
+        # 预读优化
         blockdev --setra 4096 "/dev/$disk" 2>/dev/null
     fi
 done
+# 网卡队列优化
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 if [ -n "$ETH" ]; then
     ifconfig "$ETH" txqueuelen 10000 2>/dev/null
@@ -212,6 +248,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
     systemctl start asp-tune.service || true
+    log_info "系统内核参数与磁盘调度优化已应用。"
 }
 
 # ================= 4. 应用部署逻辑 =================
@@ -296,31 +333,70 @@ install_apps() {
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (Smart-Polling)"
         
-        # 🟢 预先创建全量目录树
-        mkdir -p "$hb/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
-        mkdir -p "$hb/vertex/data/douban/set" "$hb/vertex/data/watch/set"
-        mkdir -p "$hb/vertex/data/rule/"{delete,link,rss,race,raceSet}
+        # 1. 仅创建挂载点并放开权限 (让容器自己生成内部结构)
+        mkdir -p "$hb/vertex/data"
+        chmod 777 "$hb/vertex/data"
         
-        # 🟢 数据恢复逻辑 (ZIP)
+        docker rm -f vertex &>/dev/null || true
+        
+        # 判断是否需要全新初始化
+        local need_init=true
         if [[ -n "$VX_RESTORE_URL" ]]; then
-            log_info "执行数据恢复流程..."
+            log_info "发现恢复链接，跳过原生初始化..."
             download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
             local unzip_cmd="unzip -o"
             [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
             eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$hb/vertex/\"" || true
+            need_init=false
+        elif [[ -f "$hb/vertex/data/setting.json" ]]; then
+             log_info "检测到已有配置，跳过初始化等待..."
+             need_init=false
         fi
 
-        # 🟢 配置预注入
+        # 2. 启动容器 (触发初始化)
+        log_info "启动 Vertex 容器..."
+        docker run -d --name vertex \
+            --restart unless-stopped \
+            -p $VX_PORT:3000 \
+            -v "$hb/vertex":/vertex \
+            -e TZ=Asia/Shanghai \
+            lswl/vertex:stable
+
+        # 🟢 轮询检测逻辑：等待容器生成 rule 目录
+        if [[ "$need_init" == "true" ]]; then
+            log_info "等待容器初始化目录结构..."
+            local count=0
+            local max_retries=30
+            while [ ! -d "$hb/vertex/data/rule" ] && [ $count -lt $max_retries ]; do
+                echo -n "."
+                sleep 1
+                ((count++))
+            done
+            echo ""
+            
+            if [ ! -d "$hb/vertex/data/rule" ]; then
+                log_warn "初始化检测超时，可能容器启动较慢，尝试强制继续..."
+            else
+                log_info "目录结构初始化完成。"
+            fi
+            
+            log_info "暂停容器以注入用户配置..."
+            docker stop vertex >/dev/null 2>&1 || true
+        else
+            docker stop vertex >/dev/null 2>&1 || true
+        fi
+
+        # 3. 注入配置
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         
         if [[ -f "$set_file" ]]; then
-            log_info "同步现有配置: $set_file"
+            log_info "同步访问配置至 $set_file"
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
                 '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
                 mv "${set_file}.tmp" "$set_file"
         else
-            log_info "创建初始配置..."
+            log_info "生成初始配置 setting.json..."
             cat > "$set_file" << EOF
 {
   "username": "$APP_USER",
@@ -330,17 +406,9 @@ install_apps() {
 EOF
         fi
 
-        chmod -R 777 "$hb/vertex"
-        
-        docker rm -f vertex &>/dev/null || true
-        log_info "启动 Vertex 容器..."
-        docker run -d --name vertex \
-            --restart unless-stopped \
-            -p $VX_PORT:3000 \
-            -v "$hb/vertex":/vertex \
-            -e TZ=Asia/Shanghai \
-            lswl/vertex:stable
-        
+        # 4. 最终重启
+        log_info "重启 Vertex 服务..."
+        docker start vertex
         open_port "$VX_PORT"
     fi
 
@@ -394,7 +462,6 @@ install_qbit
 
 PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "ServerIP")
 
-# 🟢 强化输出逻辑：恢复 Docker 内网信息和账号块
 echo ""
 echo -e "${GREEN}########################################################${NC}"
 echo -e "${GREEN}           Auto-Seedbox-PT 安装成功!                    ${NC}"
