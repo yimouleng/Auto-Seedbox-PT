@@ -59,6 +59,10 @@ log_err() { echo -e "${RED}[ERROR] $1${NC}" >&2; exit 1; }
 download_file() {
     local url=$1; local output=$2
     log_info "正在获取资源: $(basename "$output")"
+    if [[ "$output" == "/usr/bin/qbittorrent-nox" ]]; then
+        pkill -9 qbittorrent-nox 2>/dev/null || true
+        rm -f "$output" 2>/dev/null || true
+    fi
     if ! wget -q --show-progress --retry-connrefused --tries=3 --timeout=30 -O "$output" "$url"; then
         log_err "下载失败，请检查网络或 URL: $url"
     fi
@@ -72,13 +76,13 @@ print_banner() {
 
 check_root() { 
     if [[ $EUID -ne 0 ]]; then
-        log_err "权限不足：请使用 root 用户运行！"
+        log_err "权限不足：请使用 root 用户运行本脚本！"
     fi
 }
 
 validate_pass() {
     if [[ ${#1} -lt 8 ]]; then
-        log_err "安全性不足：密码长度必须 ≥ 8 位！当前为 ${#1} 位。"
+        log_err "安全性不足：密码长度必须 ≥ 8 位！"
     fi
 }
 
@@ -112,13 +116,14 @@ get_input_port() {
 
 uninstall() {
     local mode=$1
-    print_banner "执行卸载程序"
+    print_banner "执行卸载流程"
     read -p "确认要卸载所有组件吗？ [y/n]: " confirm < /dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
 
     log_info "正在停止原生服务..."
     systemctl stop "qbittorrent-nox@root" 2>/dev/null || true
     systemctl disable "qbittorrent-nox@root" 2>/dev/null || true
+    pkill -9 qbittorrent-nox 2>/dev/null || true
     rm -f /etc/systemd/system/qbittorrent-nox@.service /usr/bin/qbittorrent-nox
 
     log_info "正在移除 Docker 容器..."
@@ -249,6 +254,7 @@ WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
 WebUI\AuthSubnetWhitelist=127.0.0.1/32, 172.16.0.0/12, 10.0.0.0/8, 192.168.0.0/16, 172.17.0.0/16
 WebUI\AuthSubnetWhitelistEnabled=true
+WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
 WebUI\HTTPS\Enabled=false
@@ -277,18 +283,23 @@ install_apps() {
     print_banner "部署 Docker 及应用"
     wait_for_lock
     
-    # 解决 APT 依赖冲突的强力逻辑
+    # 彻底清除冲突包名
+    apt-get remove --purge containerd.io containerd docker-ce docker-ce-cli -y >/dev/null 2>&1 || true
+    
     if ! apt-get -qq install docker.io -y >/dev/null 2>&1; then
-        log_warn "检测到 APT 依赖冲突，尝试自动修复..."
+        log_warn "尝试深度修复 APT 依赖..."
         dpkg --configure -a || true
         apt-get install -f -y || true
-        apt-get install docker.io -y || log_err "Docker 自动修复失败，请手动运行 'apt-get install docker.io' 排查冲突。"
+        apt-get install docker.io -y || log_err "Docker 安装失败。"
     fi
 
     local hb="/root"
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (Smart-Polling)"
-        mkdir -p "$hb/vertex/data" && chmod -R 777 "$hb/vertex"
+        # 🟢 关键权限修复：创建目录并直接赋予 777
+        mkdir -p "$hb/vertex/data"
+        chmod -R 777 "$hb/vertex"
+        
         docker rm -f vertex &>/dev/null || true
         log_info "启动 Vertex 容器..."
         docker run -d --name vertex -p $VX_PORT:3000 -v "$hb/vertex":/vertex -e TZ=Asia/Shanghai lswl/vertex:stable
@@ -297,11 +308,17 @@ install_apps() {
         local wait_count=0
         while true; do
             if [[ -f "$hb/vertex/data/setting.json" ]] && [[ -d "$hb/vertex/data/rule" ]]; then
-                log_info "结构就绪。"
+                log_info "Vertex 原生结构初始化成功。"
                 break
             fi
             sleep 1; wait_count=$((wait_count+1))
-            if [[ $wait_count -ge 60 ]]; then log_warn "检测超时，强制继续。"; break; fi
+            if [[ $wait_count -ge 60 ]]; then 
+                log_warn "初始化检测超时，强制介入补全核心目录..."
+                mkdir -p "$hb/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
+                mkdir -p "$hb/vertex/data/douban/set" "$hb/vertex/data/watch/set"
+                chmod -R 777 "$hb/vertex/data"
+                break
+            fi
         done
         
         docker stop vertex || true
@@ -316,7 +333,7 @@ install_apps() {
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         if [[ -f "$set_file" ]]; then
-            log_info "注入配置..."
+            log_info "注入 Vertex 配置..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
                '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
                mv "${set_file}.tmp" "$set_file"
@@ -340,7 +357,7 @@ EOF
     fi
 }
 
-# ================= 5. 入口及交互逻辑 =================
+# ================= 5. 入口主流程 =================
 
 case "${1:-}" in
     --uninstall) uninstall "";;
@@ -352,12 +369,9 @@ while getopts "u:p:c:q:vftod:k:" opt; do
 done
 
 check_root
+if [[ -n "$APP_PASS" ]]; then validate_pass "$APP_PASS"; fi
 
-if [[ -n "$APP_PASS" ]]; then
-    validate_pass "$APP_PASS"
-fi
-
-print_banner "初始化环境"
+print_banner "环境初始化"
 wait_for_lock; export DEBIAN_FRONTEND=noninteractive; apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool >/dev/null
 
 if [[ -z "$APP_PASS" ]]; then
@@ -392,11 +406,11 @@ echo -e "BT 端口 : ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP)"
 echo -e "${BLUE}--------------------------------------------------------${NC}"
 echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 if [[ "$DO_VX" == "true" ]]; then
-    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
+    echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC} (Bridge模式)"
     echo -e "   └─ 提示: 下载器地址请填 ${YELLOW}172.17.0.1:$QB_WEB_PORT${NC}"
 fi
 if [[ "$DO_FB" == "true" ]]; then
     echo -e "📁 FileBrowser: ${GREEN}http://$PUB_IP:$FB_PORT${NC}"
 fi
 echo -e "${BLUE}========================================================${NC}"
-[[ "$DO_TUNE" == "true" ]] && echo -e "${YELLOW}提示: 深度优化已应用。建议 reboot 物理机以完成磁盘调度器切换。${NC}"
+[[ "$DO_TUNE" == "true" ]] && echo -e "${YELLOW}提示: 深度持久化优化已生效。${NC}"
