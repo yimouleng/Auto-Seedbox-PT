@@ -26,11 +26,21 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;36m'; NC
 # 默认端口
 QB_WEB_PORT=8080; QB_BT_PORT=20000; VX_PORT=3000; FB_PORT=8081
 
-# 参数变量
-APP_USER="admin"; APP_PASS=""; QB_CACHE=1024; QB_VER_REQ="4.3.9" 
-DO_VX=false; DO_FB=false; DO_TUNE=false; CUSTOM_PORT=false; INSTALLED_MAJOR_VER="4"
+# 参数变量初始化
+APP_USER="admin"
+APP_PASS=""
+QB_CACHE=1024
+QB_VER_REQ="4.3.9" 
+DO_VX=false
+DO_FB=false
+DO_TUNE=false
+CUSTOM_PORT=false
+VX_RESTORE_URL=""
+VX_ZIP_PASS=""
+INSTALLED_MAJOR_VER="4"
 
 TEMP_DIR=$(mktemp -d); trap 'rm -rf "$TEMP_DIR"' EXIT
+# 默认备用源
 URL_V4_AMD64="https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-4.3.9_v1.2.15/x86_64-qbittorrent-nox"
 URL_V4_ARM64="https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-4.3.9_v1.2.15/aarch64-qbittorrent-nox"
 
@@ -109,16 +119,39 @@ install_qbit() {
     print_banner "正在安装 qBittorrent"
     local hb="/root"; local url=""; local arch=$(uname -m)
     
+    # [修复] 增强的 -q 版本选择逻辑
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
-        log_info "锁定版本: 4.3.9 (Static)"
+        log_info "版本策略: 锁定 4.3.9 (Static)"
         [[ "$arch" == "x86_64" ]] && url="$URL_V4_AMD64" || url="$URL_V4_ARM64"
+        INSTALLED_MAJOR_VER="4"
     else
-        log_info "搜索版本: $QB_VER_REQ ..."
-        # 简化逻辑：非默认情况尝试搜索，搜索失败回退
-        # 为保证稳定性，此处省略复杂API调用，直接使用 v4 链接，如需 v5 请手动指定 URL
-        [[ "$arch" == "x86_64" ]] && url="$URL_V4_AMD64" || url="$URL_V4_ARM64"
+        log_info "版本策略: 搜索 [$QB_VER_REQ] ..."
+        local api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
+        local tag=""
+        
+        if [[ "$QB_VER_REQ" == "latest" ]]; then
+            tag=$(curl -sL "${api}/latest" | jq -r .tag_name)
+        else
+            # 模糊搜索匹配的 tag
+            tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
+        fi
+
+        if [[ -z "$tag" || "$tag" == "null" ]]; then
+            log_warn "未找到版本 [$QB_VER_REQ]，回退至默认 4.3.9"
+            [[ "$arch" == "x86_64" ]] && url="$URL_V4_AMD64" || url="$URL_V4_ARM64"
+            INSTALLED_MAJOR_VER="4"
+        else
+            log_info "已定位版本: $tag"
+            local fname="${arch}-qbittorrent-nox"
+            [[ "$arch" == "x86_64" ]] && fname="x86_64-qbittorrent-nox"
+            [[ "$arch" == "aarch64" ]] && fname="aarch64-qbittorrent-nox"
+            url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
+            
+            if [[ "$tag" =~ release-5 ]]; then INSTALLED_MAJOR_VER="5"; else INSTALLED_MAJOR_VER="4"; fi
+        fi
     fi
 
+    log_info "下载地址: $url"
     wget -q --show-progress -O /usr/bin/qbittorrent-nox "$url"
     chmod +x /usr/bin/qbittorrent-nox
     mkdir -p "$hb/.config/qBittorrent" "$hb/Downloads"
@@ -127,12 +160,20 @@ install_qbit() {
 
     # 磁盘检测与线程优化
     local threads_val="4"
-    local root_disk=$(df /root | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
-    local rot_path="/sys/block/$root_disk/queue/rotational"
-    if [ ! -f "$rot_path" ]; then root_disk=$(lsblk -nd -o NAME | head -1); rot_path="/sys/block/$root_disk/queue/rotational"; fi
-    if [[ -f "$rot_path" && "$(cat $rot_path)" == "0" ]]; then 
-        log_info "检测到 SSD 硬盘，启用高性能 I/O 模式"
-        threads_val="16"
+    local cache_val="$QB_CACHE"
+    
+    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
+        log_info "应用 v5 优化: 禁用应用层缓存 (DiskWriteCacheSize=-1)"
+        cache_val="-1"; threads_val="0"
+    else
+        log_info "应用 v4 优化: 缓存 $QB_CACHE MiB"
+        local root_disk=$(df /root | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
+        local rot_path="/sys/block/$root_disk/queue/rotational"
+        if [ ! -f "$rot_path" ]; then root_disk=$(lsblk -nd -o NAME | head -1); rot_path="/sys/block/$root_disk/queue/rotational"; fi
+        if [[ -f "$rot_path" && "$(cat $rot_path)" == "0" ]]; then 
+            log_info "检测到 SSD 硬盘，启用高性能 I/O (16线程)"
+            threads_val="16"
+        fi
     fi
 
     cat > "$hb/.config/qBittorrent/qBittorrent.conf" << EOF
@@ -141,7 +182,7 @@ Session\DefaultSavePath=$hb/Downloads/
 Session\AsyncIOThreadsCount=$threads_val
 [Preferences]
 Connection\PortRangeMin=$QB_BT_PORT
-Downloads\DiskWriteCacheSize=$QB_CACHE
+Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -187,8 +228,28 @@ install_apps() {
 
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "正在部署 Vertex"
-        log_info "同步 Web 账号密码..."
         mkdir -p "$hb/vertex/data"
+        
+        # [修复] Vertex 数据恢复逻辑 (-d / -k)
+        if [[ -n "$VX_RESTORE_URL" ]]; then
+            log_info "正在下载备份: $VX_RESTORE_URL"
+            wget -q -O "$TEMP_DIR/vertex_backup.zip" "$VX_RESTORE_URL" || log_warn "备份下载失败，将安装纯净版"
+            
+            if [[ -f "$TEMP_DIR/vertex_backup.zip" ]]; then
+                log_info "正在解压备份..."
+                local unzip_cmd="unzip -o"
+                [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P $VX_ZIP_PASS"
+                
+                if $unzip_cmd "$TEMP_DIR/vertex_backup.zip" -d "$hb/vertex/"; then
+                    log_info "✅ 备份恢复成功"
+                else
+                    log_err "❌ 解压失败，请检查密码 (-k) 是否正确"
+                fi
+            fi
+        fi
+
+        log_info "同步 Web 账号密码..."
+        # 即使恢复了备份，也强制覆盖 setting.json 以确保密码与参数一致 (用户体验优先)
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         cat > "$hb/vertex/data/setting.json" << EOF
 {
@@ -239,8 +300,20 @@ EOF
 if [[ "${1:-}" == "--uninstall" ]]; then uninstall ""; fi
 if [[ "${1:-}" == "--purge" ]]; then uninstall "--purge"; fi
 
-while getopts "u:p:c:q:vfto" opt; do
-    case $opt in u) APP_USER=$OPTARG ;; p) APP_PASS=$OPTARG ;; c) QB_CACHE=$OPTARG ;; v) DO_VX=true ;; f) DO_FB=true ;; t) DO_TUNE=true ;; o) CUSTOM_PORT=true ;; esac
+# [修复] 补全 getopts 字符串，确保 d, k, o, q 等参数能被正确识别
+while getopts "u:p:c:q:vftod:k:" opt; do
+    case $opt in 
+        u) APP_USER=$OPTARG ;; 
+        p) APP_PASS=$OPTARG ;; 
+        c) QB_CACHE=$OPTARG ;; 
+        q) QB_VER_REQ=$OPTARG ;;
+        v) DO_VX=true ;; 
+        f) DO_FB=true ;; 
+        t) DO_TUNE=true ;; 
+        o) CUSTOM_PORT=true ;;
+        d) VX_RESTORE_URL=$OPTARG ;;
+        k) VX_ZIP_PASS=$OPTARG ;;
+    esac
 done
 
 check_root
@@ -272,16 +345,17 @@ PUB_IP=$(curl -s --max-time 3 https://api.ipify.org || echo "ServerIP")
 
 echo ""
 echo -e "${BLUE}########################################################${NC}"
-echo -e "${GREEN}          Auto-Seedbox-PT 安装成功! (V2.7)             ${NC}"
+echo -e "${GREEN}          Auto-Seedbox-PT 安装成功! (V2.8)             ${NC}"
 echo -e "${BLUE}########################################################${NC}"
 echo -e "Web 账号: ${YELLOW}$APP_USER${NC}"
 echo -e "Web 密码: ${YELLOW}(您刚才输入的密码)${NC}"
 echo -e "BT 端口 : ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP 已放行)"
 echo -e "${BLUE}--------------------------------------------------------${NC}"
-echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
+echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC} (核心: v$INSTALLED_MAJOR_VER)"
 if [[ "$DO_VX" == "true" ]]; then
     echo -e "🌐 Vertex:      ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
     echo -e "   └─ 初始账号: ${YELLOW}$APP_USER${NC} / ${YELLOW}(同上)${NC}"
+    if [[ -n "$VX_RESTORE_URL" ]]; then echo -e "   └─ 状态: ${GREEN}数据已恢复${NC}"; fi
 fi
 if [[ "$DO_FB" == "true" ]]; then
     echo -e "📁 FileBrowser: ${GREEN}http://$PUB_IP:$FB_PORT${NC}"
