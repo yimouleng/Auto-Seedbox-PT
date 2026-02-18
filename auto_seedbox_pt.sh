@@ -126,14 +126,19 @@ uninstall() {
     pkill -9 qbittorrent-nox 2>/dev/null || true
     rm -f /etc/systemd/system/qbittorrent-nox@.service /usr/bin/qbittorrent-nox
 
-    log_info "2. 清理 Docker 容器与镜像..."
+    log_info "2. 清理 Docker 资源 (深度模式)..."
     if command -v docker >/dev/null; then
-        # 停止并删除指定容器
+        # 停止特定容器
         docker rm -f vertex filebrowser 2>/dev/null || true
-        # 删除相关镜像 (可选，防止误删其他，这里只删特定镜像)
+        # 删除特定镜像
         docker rmi lswl/vertex:stable filebrowser/filebrowser:latest 2>/dev/null || true
-        # 清理悬空网络和卷 (深度清理)
+        # 清理未使用的网络
         docker network prune -f >/dev/null 2>&1 || true
+        
+        if [[ "$mode" == "--purge" ]]; then
+            log_warn "执行 Docker 系统级清理..."
+            docker system prune -af --volumes >/dev/null 2>&1 || true
+        fi
     fi
 
     log_info "3. 移除系统优化配置..."
@@ -154,41 +159,36 @@ uninstall() {
         if [[ "$del_dl" =~ ^[Yy]$ ]]; then rm -rf "/root/Downloads"; fi
     fi
     
-    log_info "卸载完成。建议重启服务器。"
+    log_info "卸载完成。"
     exit 0
 }
 
-# ================= 3. 智能系统优化 (-t) =================
+# ================= 3. 系统全栈优化 (-t) =================
 
 optimize_system() {
-    print_banner "应用高性能系统优化 (ASP-Tuned)"
+    print_banner "应用全栈系统优化 (ASP-Tuned)"
     
     # 动态计算内存参数
     local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local rmem_max=$((mem_kb * 1024 / 2)); [[ $rmem_max -gt 134217728 ]] && rmem_max=134217728
     local tcp_mem_min=$((mem_kb / 16)); local tcp_mem_def=$((mem_kb / 8)); local tcp_mem_max=$((mem_kb / 4))
 
-    # 1. 写入 Sysctl 优化
+    # 1. Sysctl 内核参数优化
     cat > /etc/sysctl.d/99-ptbox.conf << EOF
-# 文件系统限制
 fs.file-max = 1048576
 fs.nr_open = 1048576
-# 虚拟内存策略
 vm.swappiness = 10
 vm.dirty_ratio = 60
 vm.dirty_background_ratio = 2
-# 网络核心
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
-# TCP 缓冲区 (动态计算)
 net.core.rmem_max = $rmem_max
 net.core.wmem_max = $rmem_max
 net.ipv4.tcp_rmem = 4096 87380 $rmem_max
 net.ipv4.tcp_wmem = 4096 65536 $rmem_max
 net.ipv4.tcp_mem = $tcp_mem_min $tcp_mem_def $tcp_mem_max
-# TCP 协议栈优化
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
@@ -196,7 +196,7 @@ net.ipv4.tcp_low_latency = 1
 EOF
     sysctl --system >/dev/null 2>&1 || true
 
-    # 2. 优化文件句柄限制 
+    # 2. 优化文件句柄限制
     if ! grep -q "Auto-Seedbox-PT" /etc/security/limits.conf; then
         cat >> /etc/security/limits.conf << EOF
 # Auto-Seedbox-PT Limits
@@ -207,7 +207,7 @@ root soft nofile 1048576
 EOF
     fi
 
-    # 3. 创建原生 Systemd 调优服务 
+    # 3. 增强版开机启动脚本 (磁盘调度 + 网卡物理层优化)
     cat > /usr/local/bin/asp-tune.sh << 'EOF_SCRIPT'
 #!/bin/bash
 # 磁盘调度器优化
@@ -226,11 +226,15 @@ for disk in $(lsblk -nd --output NAME | grep -v '^md' | grep -v '^loop'); do
         blockdev --setra 4096 "/dev/$disk" 2>/dev/null
     fi
 done
-# 网卡队列优化
+
+# 网卡队列与 Ring Buffer 优化
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 if [ -n "$ETH" ]; then
+    # 增加传输队列长度
     ifconfig "$ETH" txqueuelen 10000 2>/dev/null
+    # 增加 Ring Buffer (接收/发送缓冲区)
     ethtool -G "$ETH" rx 4096 tx 4096 2>/dev/null || true
+    ethtool -G "$ETH" rx 2048 tx 2048 2>/dev/null || true # 回退兼容
 fi
 EOF_SCRIPT
     chmod +x /usr/local/bin/asp-tune.sh
@@ -248,7 +252,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
     systemctl start asp-tune.service || true
-    log_info "系统内核参数与磁盘调度优化已应用。"
+    log_info "全栈系统优化 (内核+网络物理层) 已应用。"
 }
 
 # ================= 4. 应用部署逻辑 =================
@@ -320,29 +324,30 @@ install_apps() {
     print_banner "部署 Docker 及应用"
     wait_for_lock
     
-    apt-get remove --purge containerd.io containerd docker-ce docker-ce-cli -y >/dev/null 2>&1 || true
-    
-    if ! apt-get -qq install docker.io -y >/dev/null 2>&1; then
-        log_warn "尝试深度修复 APT 依赖..."
-        dpkg --configure -a || true
-        apt-get install -f -y || true
-        apt-get install docker.io -y || log_err "Docker 安装失败。"
+    # 使用官方安装脚本，保证最新稳定版
+    if ! command -v docker >/dev/null; then
+        log_info "使用官方脚本安装 Docker..."
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh >/dev/null 2>&1 || {
+            log_warn "官方脚本安装失败，尝试回退到 APT 安装..."
+            apt-get update && apt-get install -y docker.io
+        }
+        rm -f get-docker.sh
     fi
 
     local hb="/root"
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (Smart-Polling)"
         
-        # 1. 仅创建挂载点并放开权限 (让容器自己生成内部结构)
+        # 1. 创建挂载点并放开权限 (交由容器内部初始化)
         mkdir -p "$hb/vertex/data"
         chmod 777 "$hb/vertex/data"
         
         docker rm -f vertex &>/dev/null || true
         
-        # 判断是否需要全新初始化
         local need_init=true
         if [[ -n "$VX_RESTORE_URL" ]]; then
-            log_info "发现恢复链接，跳过原生初始化..."
+            log_info "下载备份数据..."
             download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
             local unzip_cmd="unzip -o"
             [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
@@ -362,7 +367,7 @@ install_apps() {
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable
 
-        # 🟢 轮询检测逻辑：等待容器生成 rule 目录
+        # 3. 轮询检测 + 智能修正
         if [[ "$need_init" == "true" ]]; then
             log_info "等待容器初始化目录结构..."
             local count=0
@@ -383,20 +388,35 @@ install_apps() {
             log_info "暂停容器以注入用户配置..."
             docker stop vertex >/dev/null 2>&1 || true
         else
+            log_info "正在智能修正备份中的 qBittorrent 配置..."
             docker stop vertex >/dev/null 2>&1 || true
+            
+            # 智能修正：遍历客户端配置，更新为当前安装参数
+            local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
+            if ls "$hb/vertex/data/client/"*.json 1> /dev/null 2>&1; then
+                for client in "$hb/vertex/data/client/"*.json; do
+                    if grep -q "qBittorrent" "$client"; then
+                         jq --arg url "http://$gw:$QB_WEB_PORT" \
+                            --arg user "$APP_USER" \
+                            --arg pass "$APP_PASS" \
+                            '.clientUrl = $url | .username = $user | .password = $pass' \
+                            "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
+                    fi
+                done
+                log_info "已自动更新 Vertex 内的下载器连接信息。"
+            fi
         fi
 
-        # 3. 注入配置
+        # 4. 注入面板登录配置
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         
         if [[ -f "$set_file" ]]; then
-            log_info "同步访问配置至 $set_file"
+            log_info "同步面板访问配置..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
                 '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
                 mv "${set_file}.tmp" "$set_file"
         else
-            log_info "生成初始配置 setting.json..."
             cat > "$set_file" << EOF
 {
   "username": "$APP_USER",
@@ -406,7 +426,7 @@ install_apps() {
 EOF
         fi
 
-        # 4. 最终重启
+        # 5. 最终重启
         log_info "重启 Vertex 服务..."
         docker start vertex
         open_port "$VX_PORT"
