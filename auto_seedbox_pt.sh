@@ -77,36 +77,47 @@ wait_for_lock() {
     done
 }
 
+# 修复：更强力的端口放行函数
 open_port() {
     local port=$1; local proto=${2:-tcp}
+    
+    # 检测 UFW 是否激活
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-        if ! ufw status | grep -q "$port"; then ufw allow "$port/$proto" >/dev/null; log_info "防火墙 UFW 已放行: $port/$proto"; fi
+        if ! ufw status | grep -q "$port"; then 
+            ufw allow "$port/$proto" >/dev/null
+            log_info "防火墙 (UFW) 已放行端口: $port/$proto"
+        fi
+    else
+        # 如果没有 UFW，尝试简单的 iptables 检查（不强制执行，避免破坏 Docker 链）
+        log_warn "未检测到活动防火墙 (UFW)，请确保云服务商安全组已放行端口: $port"
     fi
 }
 
 get_input_port() {
     local prompt=$1; local default=$2; local port
     while true; do
-        # 修复：强制从 /dev/tty 读取输入，防止管道执行时跳过
+        # 强制从 /dev/tty 读取输入
         read -p "$prompt [默认 $default]: " port < /dev/tty
         port=${port:-$default}
         if [[ ! "$port" =~ ^[0-9]+$ ]]; then log_warn "输入错误：请输入纯数字。"; continue; fi
         if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then log_warn "范围错误：端口需在 1-65535 之间。"; continue; fi
-        if ss -tuln | grep -q ":$port "; then log_warn "提示：端口 $port 已被占用，请更换。"; continue; fi
+        
+        # 端口占用检查 (排除自身)
+        if ss -tuln | grep -q ":$port "; then 
+            log_warn "提示：端口 $port 似乎已被占用，如果这是重装请忽略。"
+        fi
         echo "$port"; return 0;
     done
 }
 
-# ================= 2. 安装与配置逻辑 =================
+# ================= 2. 安装逻辑 =================
 
 uninstall() {
     echo -e "${YELLOW}========================================${NC}"
     echo -e "${YELLOW}      Auto-Seedbox-PT 卸载程序          ${NC}"
     echo -e "${YELLOW}========================================${NC}"
     
-    # 修复：强制从 /dev/tty 读取输入
     read -p "警告：将停止服务并删除配置。确定继续吗？[y/N]: " confirm < /dev/tty
-    
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
     
     log_info "正在停止服务..."
@@ -126,7 +137,6 @@ uninstall() {
         log_warn "正在执行深度清理 (配置与数据库)..."
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
         
-        # 修复：强制从 /dev/tty 读取输入
         echo -e "${RED}是否删除下载目录 (/root/Downloads)? 数据无价，请慎重！${NC}"
         read -p "输入 'yes' 确认删除: " del_dl < /dev/tty
         
@@ -190,7 +200,6 @@ install_qbit() {
     
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
 
-    # 线程与缓存优化
     local threads_val="4"; local cache_val="$QB_CACHE"
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
         log_info "应用 v5 优化: 禁用应用层缓存 (DiskWriteCacheSize=-1)"
@@ -237,6 +246,7 @@ EOF
     systemctl daemon-reload && systemctl enable "qbittorrent-nox@root" >/dev/null 2>&1
     systemctl restart "qbittorrent-nox@root"
     
+    # 确保端口放行
     open_port "$QB_WEB_PORT"; open_port "$QB_BT_PORT" "tcp"; open_port "$QB_BT_PORT" "udp"
 }
 
@@ -250,7 +260,6 @@ install_apps() {
         chmod -R 777 "$hb/vertex"
         docker rm -f vertex &>/dev/null || true
         
-        # 1. 首次启动 (Host模式) - 让 Vertex 自动生成目录
         log_info "启动 Vertex 进行初始化..."
         docker run -d --name vertex --network host \
             -v "$hb/vertex":/vertex \
@@ -260,12 +269,10 @@ install_apps() {
         log_info "等待初始化 (15s)..."
         sleep 15
         
-        # 2. 停止容器配置
         docker stop vertex >/dev/null
         
-        # 3. 恢复备份 (如果存在)
         if [[ -n "$VX_RESTORE_URL" ]]; then
-            log_info "恢复备份数据: $VX_RESTORE_URL"
+            log_info "恢复备份数据..."
             wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
             if [[ -f "$TEMP_DIR/bk.zip" ]]; then
                 local unzip_cmd="unzip -o"
@@ -274,24 +281,24 @@ install_apps() {
             fi
         fi
 
-        # 4. 写入配置 (jq 精准控制端口和密码)
+        # 写入配置 (jq)
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$hb/vertex/data/setting.json"
         
         if [ -f "$set_file" ]; then
-            log_info "更新配置文件 (端口: $VX_PORT)..."
+            log_info "配置 Vertex 端口 ($VX_PORT)..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
                '.username = $u | .password = $p | .port = $pt' \
                "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
         else
-            log_info "创建配置文件 (端口: $VX_PORT)..."
+            log_info "创建 Vertex 配置文件 (端口: $VX_PORT)..."
             cat > "$set_file" << EOF
 { "username": "$APP_USER", "password": "$vx_pass_md5", "port": $VX_PORT }
 EOF
         fi
         
-        # 5. 重启
         docker start vertex >/dev/null
+        # 确保防火墙放行 Vertex 端口
         open_port "$VX_PORT"
     fi
 
@@ -299,23 +306,28 @@ EOF
         print_banner "正在部署 FileBrowser"
         rm -rf "$hb/.config/filebrowser" "$hb/fb.db"
         
-        # 创建数据库文件并赋予写权限 (修复 permission denied)
+        # 修复权限问题: 创建文件并赋予所有人读写权限
         mkdir -p "$hb/.config/filebrowser" 
         touch "$hb/fb.db"
         chmod 666 "$hb/fb.db"
         
         docker rm -f filebrowser &>/dev/null || true
-        log_info "初始化数据库..."
-        docker run --rm -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init >/dev/null
-        docker run --rm -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin >/dev/null
+        log_info "初始化数据库 (Root权限)..."
+        
+        # 使用 --user 0:0 强制 Root 运行，彻底解决权限问题
+        docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init >/dev/null
+        docker run --rm --user 0:0 -v "$hb/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin >/dev/null
         
         log_info "启动服务..."
         docker run -d --name filebrowser --restart unless-stopped \
+            --user 0:0 \
             -v "$hb":/srv \
             -v "$hb/fb.db":/database/filebrowser.db \
             -v "$hb/.config/filebrowser":/config \
             -p $FB_PORT:80 \
             filebrowser/filebrowser:latest >/dev/null
+            
+        # 确保防火墙放行 FileBrowser 端口
         open_port "$FB_PORT"
     fi
 }
@@ -340,7 +352,6 @@ EOF
 
 # ================= 3. 主流程 =================
 
-# 优先处理卸载参数
 if [[ "${1:-}" == "--uninstall" ]]; then uninstall ""; fi
 if [[ "${1:-}" == "--purge" ]]; then uninstall "--purge"; fi
 
@@ -359,7 +370,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool >/dev/null
 
 if [[ -z "$APP_PASS" ]]; then
-    # 修复：强制从 /dev/tty 读取密码
+    # 强制从终端读取密码，防止被管道吞没
     echo -n "请输入 Web 面板密码 (至少12位): "
     read -s APP_PASS < /dev/tty
     echo ""
@@ -401,3 +412,4 @@ if [[ "$DO_FB" == "true" ]]; then
 fi
 echo -e "${BLUE}========================================================${NC}"
 if [[ "$DO_TUNE" == "true" ]]; then echo -e "${YELLOW}提示: 深度内核优化已应用，建议重启服务器生效。${NC}"; fi
+echo -e "${RED}[注意] 如果无法访问端口，请检查云服务商网页端的防火墙/安全组设置！${NC}"
