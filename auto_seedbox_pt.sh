@@ -244,57 +244,70 @@ install_apps() {
 
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "正在部署 Vertex (Host模式)"
+        mkdir -p "$hb/vertex/data"
+        chmod -R 777 "$hb/vertex"
         
-        # 1. 预先创建所有必要的目录结构 (确保 Vertex 启动时不报错)
-        log_info "预创建数据目录结构..."
-        mkdir -p "$hb/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
-        mkdir -p "$hb/vertex/data/rule/"{rss,link,race}
-        chmod -R 777 "$hb/vertex/data"
-        
-        # 2. 清理旧环境
+        # 1. 彻底清理环境
         docker rm -f vertex &>/dev/null || true
         
-        # 3. 预先生成 setting.json (Host模式下唯一可靠的改端口方法)
-        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
-        local set_file="$hb/vertex/data/setting.json"
-        
-        log_info "注入 Vertex 配置 (监听端口: $VX_PORT)..."
-        cat > "$set_file" << EOF
-{
-  "username": "$APP_USER",
-  "password": "$vx_pass_md5",
-  "port": $VX_PORT
-}
-EOF
-
-        # 4. 如果有备份，恢复备份
-        if [[ -n "$VX_RESTORE_URL" ]]; then
-            log_info "恢复备份数据..."
-            wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
-            if [[ -f "$TEMP_DIR/bk.zip" ]]; then
-                local unzip_cmd="unzip -o"
-                [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P $VX_ZIP_PASS"
-                $unzip_cmd "$TEMP_DIR/bk.zip" -d "$hb/vertex/" >/dev/null || log_warn "备份解压失败"
-                
-                # 恢复后再次强制修改端口 (因为备份里包含的是旧端口配置)
-                log_info "修正备份中的端口设置..."
-                if [ -f "$set_file" ]; then
-                    jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
-                       '.username = $u | .password = $p | .port = $pt' \
-                       "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
-                fi
-            fi
-        fi
-
-        # 5. 启动容器 (Vertex 会读取我们预设好的文件，直接监听新端口)
-        log_info "启动 Vertex..."
+        # 2. 【核心修复】首次启动：不预置文件，让Vertex自己生成完整的默认配置(端口3000)
+        log_info "步骤 1/3: 启动 Vertex 初始化默认配置..."
         docker run -d --name vertex --network host \
             -v "$hb/vertex":/vertex \
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable >/dev/null
             
-        # 6. 放行端口
+        # 3. 【智能等待】通过检测 127.0.0.1:3000 通断来判断是否完全启动
+        log_info "步骤 2/3: 等待初始化完成..."
+        local wait_limit=60
+        local initialized=false
+        for ((i=1; i<=wait_limit; i++)); do
+            if curl -s -m 1 http://127.0.0.1:3000 >/dev/null; then
+                initialized=true
+                break
+            fi
+            sleep 1
+        done
+        
+        if [ "$initialized" = "false" ]; then
+            log_warn "Vertex 初始化超时，可能已启动但无法访问，尝试强行修改配置..."
+        else
+            log_info "Vertex 初始化成功，准备修改端口..."
+        fi
+        
+        # 4. 停止容器
+        docker stop vertex >/dev/null
+        
+        # 5. 【外科手术式修改】在完整文件上修改端口，这样 Vertex 再次启动时就不会重置了
+        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
+        local set_file="$hb/vertex/data/setting.json"
+        
+        # 恢复备份 (如果存在) - 备份会覆盖刚才生成的默认文件
+        if [[ -n "$VX_RESTORE_URL" ]]; then
+            log_info "正在恢复备份数据..."
+            wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
+            if [[ -f "$TEMP_DIR/bk.zip" ]]; then
+                unzip -o ${VX_ZIP_PASS:+-P $VX_ZIP_PASS} "$TEMP_DIR/bk.zip" -d "$hb/vertex/" >/dev/null || log_warn "备份解压失败"
+            fi
+        fi
+
+        log_info "步骤 3/3: 注入自定义端口 ($VX_PORT)..."
+        # 无论是否恢复备份，都强制将端口和账号改为当前设定值
+        if [ -f "$set_file" ]; then
+            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt "$VX_PORT" \
+               '.username = $u | .password = $p | .port = $pt' \
+               "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
+        else
+            # 极少数情况文件依然不存在，兜底创建
+            cat > "$set_file" << EOF
+{ "username": "$APP_USER", "password": "$vx_pass_md5", "port": $VX_PORT }
+EOF
+        fi
+        
+        # 6. 最终重启
+        docker start vertex >/dev/null
         open_port "$VX_PORT"
+        log_info "Vertex 部署完成，已监听端口: $VX_PORT"
     fi
 
     if [[ "$DO_FB" == "true" ]]; then
