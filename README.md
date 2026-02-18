@@ -79,7 +79,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/yimouleng/Auto-Seedbox-PT/mai
 | 参数 | 必填 | 描述 | 示例 |
 |------|------|------|------|
 | `-u` | ✅ | 用户名（软件用户名） | `-u admin` |
-| `-p` | ✅ | 密码（必须 ≥ 12 位） | `-p mysecurepass` |
+| `-p` | ✅ | 密码（必须 ≥ 8 位） | `-p mysecurepass` |
 | `-c` | ✅ | 缓存大小 (MB)<br>注：v5 模式下仅作安装校验，实际由内核管理，建议1/4内存大小 | `-c 2048` |
 | `-q` | ❌ | 指定版本，支持 `4.3.9`（默认）、`latest` 或具体版本号如 `5.0.4` | `-q latest` |
 | `-v` | ❌ | 安装 Vertex 面板 | `-v` |
