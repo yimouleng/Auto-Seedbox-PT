@@ -208,7 +208,9 @@ EOF
     systemctl daemon-reload && systemctl enable "qbittorrent-nox@root" >/dev/null 2>&1
     systemctl restart "qbittorrent-nox@root"
     
-    open_port "$QB_WEB_PORT"; open_port "$QB_BT_PORT" "tcp"; open_port "$QB_BT_PORT" "udp"
+    open_port "$QB_WEB_PORT"
+    open_port "$QB_BT_PORT" "tcp"
+    open_port "$QB_BT_PORT" "udp"
 }
 
 install_docker_retry() {
@@ -305,7 +307,6 @@ EOF
 if [[ "${1:-}" == "--uninstall" ]]; then uninstall ""; fi
 if [[ "${1:-}" == "--purge" ]]; then uninstall "--purge"; fi
 
-# [重要] 确保 getopts 包含 u: 选项
 while getopts "u:p:c:q:vftod:k:" opt; do
     case $opt in 
         u) APP_USER=$OPTARG ;; p) APP_PASS=$OPTARG ;; c) QB_CACHE=$OPTARG ;; q) QB_VER_REQ=$OPTARG ;;
