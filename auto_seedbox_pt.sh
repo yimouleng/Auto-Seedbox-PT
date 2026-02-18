@@ -87,7 +87,9 @@ open_port() {
 get_input_port() {
     local prompt=$1; local default=$2; local port
     while true; do
-        read -p "$prompt [默认 $default]: " port; port=${port:-$default}
+        # 修复：强制从 /dev/tty 读取输入，防止管道执行时跳过
+        read -p "$prompt [默认 $default]: " port < /dev/tty
+        port=${port:-$default}
         if [[ ! "$port" =~ ^[0-9]+$ ]]; then log_warn "输入错误：请输入纯数字。"; continue; fi
         if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then log_warn "范围错误：端口需在 1-65535 之间。"; continue; fi
         if ss -tuln | grep -q ":$port "; then log_warn "提示：端口 $port 已被占用，请更换。"; continue; fi
@@ -95,7 +97,47 @@ get_input_port() {
     done
 }
 
-# ================= 2. 安装逻辑 =================
+# ================= 2. 安装与配置逻辑 =================
+
+uninstall() {
+    echo -e "${YELLOW}========================================${NC}"
+    echo -e "${YELLOW}      Auto-Seedbox-PT 卸载程序          ${NC}"
+    echo -e "${YELLOW}========================================${NC}"
+    
+    # 修复：强制从 /dev/tty 读取输入
+    read -p "警告：将停止服务并删除配置。确定继续吗？[y/N]: " confirm < /dev/tty
+    
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
+    
+    log_info "正在停止服务..."
+    systemctl stop "qbittorrent-nox@root" 2>/dev/null || true
+    systemctl disable "qbittorrent-nox@root" 2>/dev/null || true
+    rm -f /etc/systemd/system/qbittorrent-nox@.service /usr/bin/qbittorrent-nox
+    systemctl daemon-reload
+    
+    if command -v docker >/dev/null; then 
+        log_info "正在删除容器..."
+        docker rm -f vertex filebrowser 2>/dev/null || true
+    fi
+    rm -f /etc/sysctl.d/99-ptbox.conf
+    sysctl --system >/dev/null 2>&1
+
+    if [[ "${1:-}" == "--purge" ]]; then
+        log_warn "正在执行深度清理 (配置与数据库)..."
+        rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "/root/fb.db"
+        
+        # 修复：强制从 /dev/tty 读取输入
+        echo -e "${RED}是否删除下载目录 (/root/Downloads)? 数据无价，请慎重！${NC}"
+        read -p "输入 'yes' 确认删除: " del_dl < /dev/tty
+        
+        if [[ "$del_dl" == "yes" ]]; then
+            rm -rf "/root/Downloads"
+            log_warn "下载目录已删除。"
+        fi
+    fi
+    log_info "卸载完成。"
+    exit 0
+}
 
 install_docker_env() {
     if command -v docker >/dev/null; then return 0; fi
@@ -208,13 +250,7 @@ install_apps() {
         chmod -R 777 "$hb/vertex"
         docker rm -f vertex &>/dev/null || true
         
-        # 1. 预创建必要目录 (防 ENOENT)
-        log_info "预创建数据目录结构..."
-        mkdir -p "$hb/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
-        mkdir -p "$hb/vertex/data/rule/"{rss,link,race}
-        chmod -R 777 "$hb/vertex/data"
-
-        # 2. 首次启动 (Host模式)
+        # 1. 首次启动 (Host模式) - 让 Vertex 自动生成目录
         log_info "启动 Vertex 进行初始化..."
         docker run -d --name vertex --network host \
             -v "$hb/vertex":/vertex \
@@ -224,9 +260,10 @@ install_apps() {
         log_info "等待初始化 (15s)..."
         sleep 15
         
-        # 3. 停止容器配置
+        # 2. 停止容器配置
         docker stop vertex >/dev/null
         
+        # 3. 恢复备份 (如果存在)
         if [[ -n "$VX_RESTORE_URL" ]]; then
             log_info "恢复备份数据: $VX_RESTORE_URL"
             wget -q -O "$TEMP_DIR/bk.zip" "$VX_RESTORE_URL"
@@ -261,7 +298,11 @@ EOF
     if [[ "$DO_FB" == "true" ]]; then
         print_banner "正在部署 FileBrowser"
         rm -rf "$hb/.config/filebrowser" "$hb/fb.db"
-        mkdir -p "$hb/.config/filebrowser" && touch "$hb/fb.db"
+        
+        # 创建数据库文件并赋予写权限 (修复 permission denied)
+        mkdir -p "$hb/.config/filebrowser" 
+        touch "$hb/fb.db"
+        chmod 666 "$hb/fb.db"
         
         docker rm -f filebrowser &>/dev/null || true
         log_info "初始化数据库..."
@@ -299,6 +340,7 @@ EOF
 
 # ================= 3. 主流程 =================
 
+# 优先处理卸载参数
 if [[ "${1:-}" == "--uninstall" ]]; then uninstall ""; fi
 if [[ "${1:-}" == "--purge" ]]; then uninstall "--purge"; fi
 
@@ -317,8 +359,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool >/dev/null
 
 if [[ -z "$APP_PASS" ]]; then
+    # 修复：强制从 /dev/tty 读取密码
     echo -n "请输入 Web 面板密码 (至少12位): "
-    read -s APP_PASS; echo ""
+    read -s APP_PASS < /dev/tty
+    echo ""
 fi
 
 if [[ "$CUSTOM_PORT" == "true" ]]; then
