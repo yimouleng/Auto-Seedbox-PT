@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.6.1 (Extreme Tuning & Version Lock Edition)
+# Auto-Seedbox-PT (ASP) v1.6.3
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
@@ -467,8 +467,6 @@ EOF
 
 # ================= 5. 应用部署逻辑 =================
 
-# ================= 5. 应用部署逻辑 =================
-
 install_qbit() {
     print_banner "部署 qBittorrent (WebAPI 自动化注入版)"
     local arch=$(uname -m); local url=""
@@ -573,27 +571,22 @@ EOF
         # 登录并获取 Cookie
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        # 组装基础 JSON 载荷 (修复了 max_conns 拼写错误，取消全局/单种连接数限制)
-        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"max_conns\":-1,\"max_conns_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"queueing_enabled\":false"
+        # [严谨修复] 官方最新底层 API 的精确拼写为 max_connec 及 max_connec_per_torrent (无 "s")
+        # 组装基础 JSON 载荷
+        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"queueing_enabled\":false"
         
         # 注入 libtorrent 高级底层调优参数 (防爆内存与防吸血机制)
-        # bdecode_depth_limit/token_limit: 增强对巨大/畸形种子的解析能力
-        # upload_choking_algorithm: 1 (Anti-leech 优先反吸血)
-        # seed_choking_algorithm: 1 (Fastest upload 优先最快上传)
         json_payload="${json_payload},\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"strict_super_seeding\":false"
-
-        # 追加极限网络参数 (针对万兆/G口)
+        
+        # 追加极限网络参数
         if [[ "$TUNE_MODE" == "1" ]]; then
-            # 极高半开连接数，扩大发送缓冲区水线，开启 TOS 标记
             json_payload="${json_payload},\"max_half_open_connections\":1000,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120"
         fi
         
         # 追加版本差异参数
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            # v5 (libtorrent v2): 依赖 mmap，无需传统 disk_cache，设置 disk_io_type=1 (内存映射)
-            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1"
+            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val"
         else
-            # v4 (libtorrent v1): 传统异步 IO 和缓存管理
             if [[ "$is_ssd" == "true" ]]; then 
                 threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16")
             else
@@ -634,19 +627,12 @@ install_apps() {
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (智能轮询)"
         
+        # 恢复初始版本最稳定的容器自身驱动架构逻辑
+        mkdir -p "$HB/vertex/data"
+        chmod 777 "$HB/vertex/data"
         docker rm -f vertex &>/dev/null || true
         
-        log_info "预先构建 Vertex 核心目录树，避开容器初始化竞态..."
-        mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
-        mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
-        mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
-
-        # 必须先声明变量，防止 set -u 报错退出
         local need_init=true
-        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
-        local set_file="$HB/vertex/data/setting.json"
-
-        # 判断是否需要下载备份并解压
         if [[ -n "$VX_RESTORE_URL" ]]; then
             log_info "下载备份数据..."
             download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
@@ -654,32 +640,52 @@ install_apps() {
             [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
             eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/\"" || true
             need_init=false
-        elif [[ -f "$set_file" ]]; then
-            # 如果没有提供下载链接，但本地已经有 setting.json，说明是本地覆盖安装
-            need_init=false
+        elif [[ -f "$HB/vertex/data/setting.json" ]]; then
+             log_info "检测到已有配置，跳过初始化等待..."
+             need_init=false
         fi
 
-        # 判断是否为恢复模式/已有配置
-        if [[ -f "$set_file" ]]; then
-            log_info "检测到已有 setting.json，精准更新 WebUI 凭据，保留原有配置..."
-            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
-               '.username = $u | .password = $p' "$set_file" > "${set_file}.tmp" && \
-               mv "${set_file}.tmp" "$set_file" || true
+        log_info "启动 Vertex 容器..."
+        docker run -d --name vertex \
+            --restart unless-stopped \
+            -p $VX_PORT:3000 \
+            -v "$HB/vertex":/vertex \
+            -e TZ=Asia/Shanghai \
+            lswl/vertex:stable >/dev/null 2>&1
+
+        # 让容器先跑起来释放文件，脚本进行安全等待
+        echo -n -e "${YELLOW}等待 Vertex 容器初始化目录结构 ${NC}"
+        sleep 5
+
+        if [[ "$need_init" == "true" ]]; then
+            local count=0
+            while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 30 ]; do
+                echo -n "."
+                sleep 1
+                count=$((count + 1))
+            done
+            echo ""
+            
+            if [[ ! -d "$HB/vertex/data/rule" ]]; then
+                log_warn "Vertex 目录初始化结束，正在触发智能干预，手动补全核心目录结构..."
+                mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
+                mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
+                mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
+            else
+                log_info "Vertex 初始目录结构已自动生成就绪。"
+            fi
+            
+            log_info "修正目录权限..."
+            chown -R "$APP_USER:$APP_USER" "$HB/vertex"
+            chmod -R 777 "$HB/vertex/data"
+            
+            # 停止容器以防写入冲突
+            docker stop vertex >/dev/null 2>&1 || true
         else
-            log_info "全新安装，生成初始 setting.json..."
-            cat > "$set_file" << EOF
-{
-  "username": "$APP_USER",
-  "password": "$vx_pass_md5",
-  "port": 3000
-}
-EOF
-        fi
-
-        # 处理下载器网关配置修正 (针对恢复备份的情况)
-        if [[ "$need_init" == "false" ]]; then
             log_info "智能修正备份中的下载器配置..."
+            docker stop vertex >/dev/null 2>&1 || true
             local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
+            
             shopt -s nullglob
             local client_files=("$HB/vertex/data/client/"*.json)
             if [ ${#client_files[@]} -gt 0 ]; then
@@ -692,22 +698,34 @@ EOF
                             "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
                     fi
                 done
+                log_info "连接信息已修正。"
             fi
             shopt -u nullglob
         fi
 
-        # 暴力赋予最高权限，杜绝 Docker 内 root 用户写入失败
-        chmod -R 777 "$HB/vertex/data"
+        # 强制精准注入用户指定的 Web 密码，彻底修复无效 bug
+        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
+        local set_file="$HB/vertex/data/setting.json"
+        
+        if [[ -f "$set_file" ]]; then
+            log_info "同步面板访问配置..."
+            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
+                '.username = $u | .password = $p' "$set_file" > "${set_file}.tmp" && \
+                mv "${set_file}.tmp" "$set_file" || true
+        else
+            cat > "$set_file" << EOF
+{
+  "username": "$APP_USER",
+  "password": "$vx_pass_md5",
+  "port": 3000
+}
+EOF
+        fi
+        
         chown -R "$APP_USER:$APP_USER" "$HB/vertex"
 
-        log_info "启动 Vertex 容器..."
-        docker run -d --name vertex \
-            --restart unless-stopped \
-            -p $VX_PORT:3000 \
-            -v "$HB/vertex":/vertex \
-            -e TZ=Asia/Shanghai \
-            lswl/vertex:stable >/dev/null 2>&1
-
+        log_info "重启 Vertex 服务..."
+        docker start vertex >/dev/null 2>&1 || true
         open_port "$VX_PORT"
     fi
 
@@ -747,7 +765,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 参数防呆校验
 if [[ "$TUNE_MODE" != "1" && "$TUNE_MODE" != "2" ]]; then
     TUNE_MODE="1"
 fi
@@ -758,11 +775,8 @@ elif [[ "$ACTION" == "purge" ]]; then
     uninstall "--purge"
 fi
 
-check_root
-
 print_banner "环境初始化与前置检测"
 
-# =============== 1. 内存硬性防呆机制 ===============
 mem_kb_chk=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 mem_gb_chk=$((mem_kb_chk / 1024 / 1024))
 if [[ "$TUNE_MODE" == "1" && $mem_gb_chk -lt 4 ]]; then
@@ -775,7 +789,6 @@ if [[ "$TUNE_MODE" == "1" && $mem_gb_chk -lt 4 ]]; then
     sleep 3
 fi
 
-# =============== 2. 警告提示逻辑 ===============
 if [[ "$DO_TUNE" == "true" ]]; then
     if [[ "$TUNE_MODE" == "1" ]]; then
         echo -e "${RED}================================================================${NC}"
@@ -784,6 +797,7 @@ if [[ "$DO_TUNE" == "true" ]]; then
         echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/SSD 的独立服务器进行极限刷流抢种！${NC}"
         echo -e "${RED} ⚠️ 家用 NAS、或者只想保种刷流请终止安装，使用 -m 2 重新运行！${NC}"
         echo -e "${RED}================================================================${NC}"
+        
         echo -e "${YELLOW}请仔细阅读以上高危警告，3秒后开始执行底层环境检测...${NC}"
         sleep 3
     else
@@ -795,11 +809,10 @@ if [[ -z "$APP_USER" ]]; then APP_USER="admin"; fi
 if [[ -n "$APP_PASS" ]]; then validate_pass "$APP_PASS"; fi
 
 echo ""
-# =============== 3. 显性化实时初始化进度 ===============
 log_info "-> [1/4] 检测系统基础架构与资源..."
 arch_chk=$(uname -m); kernel_chk=$(uname -r)
 echo -e "   架构: ${arch_chk} | 内核: ${kernel_chk} | 物理内存: ${mem_gb_chk} GB"
-sleep 1 # 给定极短缓冲，提升视觉流畅度
+sleep 1 
 
 log_info "-> [2/4] 验证管理员权限与网络连通性..."
 check_root
@@ -818,7 +831,6 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool iptables >/dev/null
 echo -e "${GREEN} [就绪] 基础环境初始化与依赖部署完成！${NC}\n"
 
-# =============== 4. 补充交互式密码输入 ===============
 if [[ -z "$APP_PASS" ]]; then
     while true; do
         echo -n "请输入 Web 面板统一密码 (必须 ≥ 8 位): "
