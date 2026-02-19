@@ -186,7 +186,7 @@ setup_user() {
     log_info "工作目录设定为: $HB"
 }
 
-# ================= 3. 深度卸载逻辑 =================
+# ================= 3. 深度卸载逻辑 (彻底回滚) =================
 
 uninstall() {
     local mode=$1
@@ -228,7 +228,7 @@ uninstall() {
     pkill -9 qbittorrent-nox 2>/dev/null || true
     rm -f /usr/bin/qbittorrent-nox
 
-    log_info "2. 清理 Docker 资源..."
+    log_info "2. 清理 Docker 资源 (精准移除)..."
     if command -v docker >/dev/null; then
         docker rm -f vertex filebrowser 2>/dev/null || true
         docker rmi lswl/vertex:stable filebrowser/filebrowser:latest 2>/dev/null || true
@@ -244,7 +244,8 @@ uninstall() {
     fi
     
     if [[ "$mode" == "--purge" ]]; then
-        log_warn "执行底层状态回滚..."
+        log_warn "执行底层状态回滚 (CPU调度器 / 网卡队列 / TCP参数)..."
+        # 智能恢复 CPU Governor 原始状态
         if [ -f /etc/asp_original_governor ]; then
             orig_gov=$(cat /etc/asp_original_governor)
             for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -257,6 +258,7 @@ uninstall() {
             done
         fi
         
+        # 恢复常用网卡队列和拥塞窗口
         ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
         if [ -n "$ETH" ]; then
             ifconfig "$ETH" txqueuelen 1000 2>/dev/null || true
@@ -265,6 +267,7 @@ uninstall() {
         if [[ -n "$DEF_ROUTE" ]]; then
             ip route change $DEF_ROUTE initcwnd 10 initrwnd 10 2>/dev/null || true
         fi
+        # 暴力恢复基础 Sysctl 参数
         sysctl -w net.core.rmem_max=212992 >/dev/null 2>&1 || true
         sysctl -w net.core.wmem_max=212992 >/dev/null 2>&1 || true
         sysctl -w net.ipv4.tcp_rmem="4096 87380 6291456" >/dev/null 2>&1 || true
@@ -274,6 +277,7 @@ uninstall() {
         sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
     fi
     
+    # 彻底清理所有受支持防火墙的规则
     if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
         ufw delete allow $QB_WEB_PORT/tcp >/dev/null 2>&1 || true
         ufw delete allow $QB_BT_PORT/tcp >/dev/null 2>&1 || true
@@ -311,6 +315,7 @@ uninstall() {
              rm -rf "$target_home/.config/qBittorrent" "$target_home/vertex" "$target_home/.config/filebrowser"
              log_info "已清理 $target_home 下的配置文件。"
              
+             # 新增：交互式询问是否删除下载数据目录
              if [[ -d "$target_home/Downloads" ]]; then
                  echo -e "${YELLOW}=================================================${NC}"
                  log_warn "检测到可能包含大量数据的目录: $target_home/Downloads"
@@ -332,7 +337,7 @@ uninstall() {
     exit 0
 }
 
-# ================= 4. 智能系统优化 =================
+# ================= 4. 智能系统优化 (区分极致/均衡) =================
 
 optimize_system() {
     print_banner "应用智能系统优化 (ASP-Tuned - 模式 $TUNE_MODE)"
@@ -346,11 +351,13 @@ optimize_system() {
     local backlog=65535
     local syn_backlog=65535
     
+    # 动态探测系统可用的拥塞控制算法 (Fallback to BBR)
     local avail_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "bbr cubic reno")
     local target_cc="bbr"
 
+    # 1=极限模式, 2=均衡模式
     if [[ "$TUNE_MODE" == "1" ]]; then
-        rmem_max=1073741824 
+        rmem_max=1073741824 # 1GB
         tcp_wmem="4096 65536 1073741824"
         tcp_rmem="4096 87380 1073741824"
         dirty_ratio=60
@@ -358,6 +365,7 @@ optimize_system() {
         backlog=250000
         syn_backlog=819200
         
+        # BBR 极限算法自动挂载
         if echo "$avail_cc" | grep -qw "bbrx"; then
             target_cc="bbrx"
             log_warn "已侦测到 BBRx 自定义内核，自动挂载抢跑算法！"
@@ -366,12 +374,14 @@ optimize_system() {
             log_warn "已侦测到 BBRv3 内核，自动挂载高级拥塞算法！"
         fi
         
+        # 保存 CPU Governor 原始状态用于无损恢复
         if [ ! -f /etc/asp_original_governor ]; then
             cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null > /etc/asp_original_governor || echo "ondemand" > /etc/asp_original_governor
         fi
         
         log_warn "已启用极限内核参数，为 G口/万兆网卡 提供最大化吞吐支持！"
     else
+        # 均衡模式限制上限
         [[ $rmem_max -gt 134217728 ]] && rmem_max=134217728
         tcp_wmem="4096 65536 $rmem_max"
         tcp_rmem="4096 87380 $rmem_max"
@@ -412,10 +422,12 @@ root soft nofile 1048576
 EOF
     fi
 
+    # 动态生成 asp-tune.sh
     cat > /usr/local/bin/asp-tune.sh << EOF_SCRIPT
 #!/bin/bash
 IS_VIRT=\$(systemd-detect-virt 2>/dev/null || echo "none")
 
+# 极限模式: 锁定 CPU 性能
 if [[ "$TUNE_MODE" == "1" ]]; then
     for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         [ -f "\$f" ] && echo "performance" > "\$f" 2>/dev/null
@@ -465,14 +477,14 @@ EOF
     log_info "系统核心优化 (模式 $TUNE_MODE, TCP: $target_cc) 已应用完毕。"
 }
 
-# ================= 5. 应用部署逻辑 =================
+# ================= 5. 应用部署逻辑 (核心修正部分) =================
 
 install_qbit() {
-print_banner "部署 qBittorrent (节结构优化版)"
+    print_banner "部署 qBittorrent"
     local arch=$(uname -m); local url=""
     local api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
     
-    # 1. 版本判定与下载
+    # 智能判断版本库
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
         INSTALLED_MAJOR_VER="4"
         log_info "锁定版本: 4.x (绑定 libtorrent v1.2.x)"
@@ -480,43 +492,47 @@ print_banner "部署 qBittorrent (节结构优化版)"
     else
         INSTALLED_MAJOR_VER="5"
         log_info "锁定大版本: 5.x (绑定 libtorrent v2.0.x 支持 mmap)"
-        local tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
-        [[ "$QB_VER_REQ" != "5" && "$QB_VER_REQ" != "latest" ]] && \
+        local tag=""
+        if [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "latest" ]]; then
+            tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
+        else
             tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
+        fi
+        [[ -z "$tag" || "$tag" == "null" ]] && log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
         url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${arch}-qbittorrent-nox"
     fi
     
     download_file "$url" "/usr/bin/qbittorrent-nox"
     chmod +x /usr/bin/qbittorrent-nox
     
-    # ⚠️ 关键步骤：在写入配置前彻底停止进程，防止旧配置在退出时覆盖新配置
-    log_info "正在清理旧进程以锁定配置文件..."
+    # ⚠️ 修复关键：在写入配置前，必须彻底杀死所有 qB 进程并清理锁文件，防止 QtLockedFile 报错和配置回刷
+    log_info "深度清理残留进程与文件锁..."
     systemctl stop "qbittorrent-nox@$APP_USER" 2>/dev/null || true
     pkill -9 -u "$APP_USER" qbittorrent-nox 2>/dev/null || true
-    sleep 2
-
-    mkdir -p "$HB/.config/qBittorrent" "$HB/Downloads"
+    
+    mkdir -p "$HB/.config/qBittorrent" "$HB/.local/share/qBittorrent" "$HB/Downloads"
+    rm -f "$HB/.config/qBittorrent"/*.lock "$HB/.local/share/qBittorrent"/*.lock
+    
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
 
-    # 2. 动态生成配置 (严格区分 Section)
-    log_info "正在应用 $INSTALLED_MAJOR_VER.x 版本的优化配置结构..."
+    # 硬件环境侦测
+    local root_disk=$(df $HB | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
+    local is_ssd=false
+    if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then is_ssd=true; fi
 
-    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-        # 5.x 极致调优参数 (全部放入 Preferences)
-        local tune_params=""
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            tune_params="Advanced\DiskIOType=0
-Advanced\DiskIOReadMode=0
-Advanced\DiskIOWriteMode=0
-Advanced\HashingThreadsCount=0
-Advanced\SendBufferWatermark=10240
-Advanced\SendBufferLowWatermark=3072
-Advanced\SendBufferTOSMark=2"
-        fi
+    local threads_val="4"; local cache_val="$QB_CACHE"
 
+    # ======== 修正 Section 归属与参数命名 (兼容 4.x 和 5.x) ========
+    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
+        cache_val="-1" # 5.x 使用 mmap
+        threads_val="0"
+        
+        # 5.x 专用分区逻辑
         cat > "$config_file" << EOF
 [Preferences]
+Downloads\SavePath=$HB/Downloads/
+Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -526,8 +542,6 @@ WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
 WebUI\HTTPS\Enabled=false
-Downloads\SavePath=$HB/Downloads/
-Downloads\DiskWriteCacheSize=-1
 Connection\PortRangeMin=$QB_BT_PORT
 Connection\GlobalDLLimit=-1
 Connection\GlobalUPLimit=-1
@@ -539,8 +553,8 @@ Connection\MaxHalfOpenConnections=500
 Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
-Advanced\AsyncIOThreadsCount=0
-$tune_params
+Advanced\AsyncIOThreadsCount=$threads_val
+$( [[ "$TUNE_MODE" == "1" ]] && echo -e "Advanced\DiskIOType=0\nAdvanced\DiskIOReadMode=0\nAdvanced\DiskIOWriteMode=0\nAdvanced\HashingThreadsCount=0\nAdvanced\SendBufferWatermark=10240\nAdvanced\SendBufferLowWatermark=3072\nAdvanced\SendBufferTOSMark=2" )
 
 [BitTorrent]
 Bittorrent\DHTEnabled=false
@@ -552,16 +566,13 @@ Bittorrent\MaxSeedingTime=-1
 EOF
 
     else
-        # 4.x 调优参数 (4.x 使用 Session\ 前缀)
-        local tune_params_v4=""
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            tune_params_v4="Connection\MaxHalfOpenConnections=500
-Session\SendBufferWatermark=10240
-Session\SendBufferLowWatermark=3072"
-        fi
-
+        # 4.x 逻辑
+        [[ "$is_ssd" == "true" ]] && threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16") || threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
+        
         cat > "$config_file" << EOF
 [Preferences]
+Downloads\SavePath=$HB/Downloads/
+Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -570,8 +581,6 @@ WebUI\AuthSubnetWhitelistEnabled=true
 WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
-Downloads\SavePath=$HB/Downloads/
-Downloads\DiskWriteCacheSize=$QB_CACHE
 Connection\PortRangeMin=$QB_BT_PORT
 Connection\GlobalDLLimit=-1
 Connection\GlobalUPLimit=-1
@@ -579,11 +588,12 @@ Connection\MaxConnections=-1
 Connection\MaxConnectionsPerTorrent=-1
 Connection\MaxUploads=-1
 Connection\MaxUploadsPerTorrent=-1
+Connection\MaxHalfOpenConnections=500
 Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
-Session\AsyncIOThreadsCount=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "12")
-$tune_params_v4
+Session\AsyncIOThreadsCount=$threads_val
+$( [[ "$TUNE_MODE" == "1" ]] && echo -e "Session\SendBufferWatermark=10240\nSession\SendBufferLowWatermark=3072" )
 
 [BitTorrent]
 Bittorrent\DHTEnabled=false
@@ -595,12 +605,12 @@ Bittorrent\MaxSeedingTime=-1
 EOF
     fi
 
-    # 3. 权限与启动
+    # 强力权限覆盖，确保服务能够读写配置和数据库
     sed -i '/^$/d' "$config_file"
-    chown "$APP_USER:$APP_USER" "$config_file"
+    chown -R "$APP_USER:$APP_USER" "$HB/.config" "$HB/.local" "$HB/Downloads"
+    chmod -R 755 "$HB/.config" "$HB/.local"
     chmod 600 "$config_file"
     
-    # 确保服务文件存在
     cat > /etc/systemd/system/qbittorrent-nox@.service << EOF
 [Unit]
 Description=qBittorrent Service (User: %i)
@@ -615,14 +625,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
-    systemctl start "qbittorrent-nox@$APP_USER"
-    
-    open_port "$QB_WEB_PORT"
-    open_port "$QB_BT_PORT" "tcp"
-    open_port "$QB_BT_PORT" "udp"
+    systemctl daemon-reload && systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
+    systemctl restart "qbittorrent-nox@$APP_USER"
+    open_port "$QB_WEB_PORT"; open_port "$QB_BT_PORT" "tcp"; open_port "$QB_BT_PORT" "udp"
 }
 
 install_apps() {
@@ -631,20 +636,13 @@ install_apps() {
     
     if ! command -v docker >/dev/null; then
         log_info "使用官方脚本安装 Docker..."
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sh get-docker.sh >/dev/null 2>&1 || {
-            log_warn "官方脚本安装失败，尝试回退到 APT 安装..."
-            apt-get update && apt-get install -y docker.io
-        }
-        rm -f get-docker.sh
+        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
     fi
 
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (智能轮询)"
-        
         mkdir -p "$HB/vertex/data"
         chmod 777 "$HB/vertex/data"
-        
         docker rm -f vertex &>/dev/null || true
         
         local need_init=true
@@ -656,19 +654,10 @@ install_apps() {
             eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/\"" || true
             need_init=false
         elif [[ -f "$HB/vertex/data/setting.json" ]]; then
-             log_info "检测到已有配置，跳过初始化等待..."
              need_init=false
         fi
 
-        log_info "启动 Vertex 容器..."
-        docker run -d --name vertex \
-            --restart unless-stopped \
-            -p $VX_PORT:3000 \
-            -v "$HB/vertex":/vertex \
-            -e TZ=Asia/Shanghai \
-            lswl/vertex:stable
-
-        log_info "等待 5 秒以让容器生成初始配置目录..."
+        docker run -d --name vertex --restart unless-stopped -p $VX_PORT:3000 -v "$HB/vertex":/vertex -e TZ=Asia/Shanghai lswl/vertex:stable
         sleep 5
 
         if [[ "$need_init" == "true" ]]; then
@@ -676,64 +665,47 @@ install_apps() {
             local count=0
             while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 30 ]; do
                 echo -n "."
-                sleep 1
-                count=$((count + 1))
+                sleep 1; count=$((count + 1))
             done
             echo ""
             
-            log_info "补全核心目录结构..."
-            mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
-            mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
-            mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
+            # 按需补全逻辑
+            if [ ! -d "$HB/vertex/data/site" ]; then
+                log_info "补全核心目录结构..."
+                mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
+                mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
+                mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
+            fi
             
-            log_info "修正目录权限..."
             chown -R "$APP_USER:$APP_USER" "$HB/vertex"
             chmod -R 777 "$HB/vertex/data"
-            
             docker stop vertex >/dev/null 2>&1 || true
         else
             log_info "智能修正备份中的下载器配置..."
             docker stop vertex >/dev/null 2>&1 || true
             local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
-            
             shopt -s nullglob
             local client_files=("$HB/vertex/data/client/"*.json)
             if [ ${#client_files[@]} -gt 0 ]; then
                 for client in "${client_files[@]}"; do
                     if grep -q "qBittorrent" "$client"; then
-                         jq --arg url "http://$gw:$QB_WEB_PORT" \
-                            --arg user "$APP_USER" \
-                            --arg pass "$APP_PASS" \
-                            '.clientUrl = $url | .username = $user | .password = $pass' \
-                            "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
+                         jq --arg url "http://$gw:$QB_WEB_PORT" --arg user "$APP_USER" --arg pass "$APP_PASS" '.clientUrl = $url | .username = $user | .password = $pass' "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
                     fi
                 done
-                log_info "连接信息已修正。"
             fi
             shopt -u nullglob
         fi
 
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$HB/vertex/data/setting.json"
-        
         if [[ -f "$set_file" ]]; then
-            log_info "同步面板访问配置..."
-            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
-                '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
-                mv "${set_file}.tmp" "$set_file"
+            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
         else
             cat > "$set_file" << EOF
-{
-  "username": "$APP_USER",
-  "password": "$vx_pass_md5",
-  "port": 3000
-}
+{ "username": "$APP_USER", "password": "$vx_pass_md5", "port": 3000 }
 EOF
         fi
-        
         chown -R "$APP_USER:$APP_USER" "$HB/vertex"
-
-        log_info "重启 Vertex 服务..."
         docker start vertex
         open_port "$VX_PORT"
     fi
@@ -741,12 +713,9 @@ EOF
     if [[ "$DO_FB" == "true" ]]; then
         print_banner "部署 FileBrowser"
         rm -rf "$HB/.config/filebrowser" "$HB/fb.db"; mkdir -p "$HB/.config/filebrowser" && touch "$HB/fb.db" && chmod 666 "$HB/fb.db"
-        chown -R "$APP_USER:$APP_USER" "$HB/.config/filebrowser" "$HB/fb.db"
-
         docker rm -f filebrowser &>/dev/null || true
         docker run --rm --user 0:0 -v "$HB/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init
         docker run --rm --user 0:0 -v "$HB/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin
-        
         docker run -d --name filebrowser --restart unless-stopped --user 0:0 -v "$HB":/srv -v "$HB/fb.db":/database/filebrowser.db -v "$HB/.config/filebrowser":/config -p $FB_PORT:80 filebrowser/filebrowser:latest
         open_port "$FB_PORT"
     fi
@@ -774,47 +743,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 参数防呆校验
-if [[ "$TUNE_MODE" != "1" && "$TUNE_MODE" != "2" ]]; then
-    TUNE_MODE="1"
-fi
-
-if [[ "$ACTION" == "uninstall" ]]; then
-    uninstall ""
-elif [[ "$ACTION" == "purge" ]]; then
-    uninstall "--purge"
-fi
+if [[ "$TUNE_MODE" != "1" && "$TUNE_MODE" != "2" ]]; then TUNE_MODE="1"; fi
+if [[ "$ACTION" == "uninstall" ]]; then uninstall ""; elif [[ "$ACTION" == "purge" ]]; then uninstall "--purge"; fi
 
 check_root
-
 print_banner "环境初始化"
 
-# =============== 内存硬性防呆机制 ===============
 mem_kb_chk=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 mem_gb_chk=$((mem_kb_chk / 1024 / 1024))
 if [[ "$TUNE_MODE" == "1" && $mem_gb_chk -lt 4 ]]; then
-    echo -e "${RED}================================================================${NC}"
-    echo -e "${RED} [警告] 内存防呆机制触发！检测到系统物理内存不足 4GB (当前: ${mem_gb_chk}GB)！${NC}"
-    echo -e "${RED} ⚠️ 极限模式 (分配 1GB TCP 发送/接收缓冲区) 会导致本机瞬间 OOM 死机！${NC}"
-    echo -e "${RED} ⚠️ 已为您强制降级为 Balanced (均衡保种) 模式！${NC}"
-    echo -e "${RED}================================================================${NC}"
-    TUNE_MODE="2"
-    sleep 3
+    echo -e "${RED} [警告] 内存不足 4GB，强制降级为均衡模式！${NC}"
+    TUNE_MODE="2"; sleep 3
 fi
 
-# 警告提示逻辑
 if [[ "$DO_TUNE" == "true" ]]; then
-    if [[ "$TUNE_MODE" == "1" ]]; then
-        echo -e "${RED}================================================================${NC}"
-        echo -e "${RED} [警告] 您选择了 1 (极限刷流) 调优模式！${NC}"
-        echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区，极大消耗内存！${NC}"
-        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/SSD 的独立服务器进行极限刷流抢种！${NC}"
-        echo -e "${RED} ⚠️ 家用 NAS、或者只想保种刷流请终止安装，使用 -m 2 重新运行！${NC}"
-        echo -e "${RED}================================================================${NC}"
-        sleep 5
-    else
-        echo -e "${GREEN} -> 当前系统调优模式: 2 (均衡保种)${NC}"
-    fi
+    [[ "$TUNE_MODE" == "1" ]] && { echo -e "${RED} [警告] 已开启 1 (极限刷流) 模式！${NC}"; sleep 5; } || echo -e "${GREEN} -> 当前系统调优模式: 2 (均衡保种)${NC}"
 fi
 
 if [[ -z "$APP_USER" ]]; then APP_USER="admin"; fi
@@ -854,7 +797,6 @@ echo -e "${GREEN}########################################################${NC}"
 echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 
 if [[ "$DO_VX" == "true" ]]; then
-    VX_IN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vertex 2>/dev/null || echo "Unknown")
     VX_GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
     echo -e "🌐 Vertex:       ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
     echo -e "    └─ 下载器连接填写: ${YELLOW}$VX_GW:$QB_WEB_PORT${NC}"
