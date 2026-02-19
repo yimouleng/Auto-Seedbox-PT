@@ -1,14 +1,14 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.3 (Extreme Tuning Edition)
+# Auto-Seedbox-PT (ASP) v1.4 (Extreme Tuning & Version Lock Edition)
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
 #   -u : 用户名 (用于运行服务和登录WebUI)
 #   -p : 密码（必须 ≥ 8 位）
 #   -c : qBittorrent 缓存大小 (MiB, 仅4.x有效, 5.x使用mmap)
-#   -q : qBittorrent 版本 (4.3.9 或 5)
+#   -q : qBittorrent 版本 (4.3.9, 5, latest, 或精确小版本如 5.0.4)
 #   -v : 安装 Vertex
 #   -f : 安装 FileBrowser
 #   -t : 启用系统内核优化（强烈推荐）
@@ -480,8 +480,21 @@ install_qbit() {
         [[ "$arch" == "x86_64" ]] && url="$URL_V4_AMD64" || url="$URL_V4_ARM64"
     else
         INSTALLED_MAJOR_VER="5"
-        log_info "锁定版本: 5.x (绑定 libtorrent v2.0.x 支持 mmap)"
-        local tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
+        log_info "锁定大版本: 5.x (绑定 libtorrent v2.0.x 支持 mmap)"
+        
+        local tag=""
+        if [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "latest" ]]; then
+            tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
+            log_info "正在拉取最新版本: $tag"
+        else
+            # 精确匹配指定的小版本，如 5.0.4
+            tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
+            if [[ -z "$tag" || "$tag" == "null" ]]; then
+                log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
+            fi
+            log_info "正在拉取指定版本: $tag"
+        fi
+        
         local fname="${arch}-qbittorrent-nox-lt20"; [[ "$arch" == "x86_64" ]] && fname="x86_64-qbittorrent-nox-lt20"
         url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
     fi
@@ -754,8 +767,8 @@ if [[ "$DO_TUNE" == "true" ]]; then
         echo -e "${RED}================================================================${NC}"
         echo -e "${RED} [警告] 您选择了 1 (极限刷流) 调优模式！${NC}"
         echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区，极大消耗内存！${NC}"
-        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/NVMe 的独立服务器进行首发抢种！${NC}"
-        echo -e "${RED} ⚠️ 家用 NAS、廉价 VPS 保种请终止安装，使用 -m 2 重新运行！${NC}"
+        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/SSD 的独立服务器进行极限刷流抢种！${NC}"
+        echo -e "${RED} ⚠️ 家用 NAS、或者只想保种刷流请终止安装，使用 -m 2 重新运行！${NC}"
         echo -e "${RED}================================================================${NC}"
         sleep 5
     else
