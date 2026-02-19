@@ -1,14 +1,14 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.6.5 
-# qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
+# Auto-Seedbox-PT (ASP) 
+# qBittorrent + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
 #   -u : 用户名 (用于运行服务和登录WebUI)
 #   -p : 密码（必须 ≥ 8 位）
 #   -c : qBittorrent 缓存大小 (MiB, 仅4.x有效, 5.x使用mmap)
-#   -q : qBittorrent 版本 (4.3.9, 5, latest, 或精确小版本如 5.0.4)
+#   -q : qBittorrent 版本 (4, 4.3.9, 5, 5.0.4, latest, 或精确小版本如 5.1.2)
 #   -v : 安装 Vertex
 #   -f : 安装 FileBrowser
 #   -t : 启用系统内核优化（强烈推荐）
@@ -54,8 +54,11 @@ HB="/root"
 TEMP_DIR=$(mktemp -d -t asp-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-URL_V4_AMD64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent-4.3.9/x86_64/qBittorrent-4.3.9%20-%20libtorrent-v1.2.20/qbittorrent-nox"
-URL_V4_ARM64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent-4.3.9/ARM64/qBittorrent-4.3.9%20-%20libtorrent-v1.2.20/qbittorrent-nox"
+# 个人专属固化直链库 (兜底与默认版本)
+URL_V4_AMD64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/x86_64/qBittorrent-4.3.9-libtorrent-v1.2.20/qbittorrent-nox"
+URL_V4_ARM64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/ARM64/qBittorrent-4.3.9-libtorrent-v1.2.20/qbittorrent-nox"
+URL_V5_AMD64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/x86_64/qBittorrent-5.0.4-libtorrent-v2.0.11/qbittorrent-nox"
+URL_V5_ARM64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/ARM64/qBittorrent-5.0.4-libtorrent-v2.0.11/qbittorrent-nox"
 
 # ================= 1. 核心工具函数 & UI 增强 =================
 
@@ -63,7 +66,6 @@ log_info() { echo -e "${GREEN}[INFO] $1${NC}" >&2; }
 log_warn() { echo -e "${YELLOW}[WARN] $1${NC}" >&2; }
 log_err() { echo -e "${RED}[ERROR] $1${NC}" >&2; exit 1; }
 
-# 新增：优雅的后台任务加载动画
 execute_with_spinner() {
     local msg="$1"
     shift
@@ -72,7 +74,7 @@ execute_with_spinner() {
     local pid=$!
     local delay=0.1
     local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    printf "\e[?25l" # 隐藏光标
+    printf "\e[?25l"
     while kill -0 $pid 2>/dev/null; do
         local temp=${spinstr#?}
         printf "\r\033[K ${CYAN}[%c]${NC} %s..." "$spinstr" "$msg"
@@ -81,7 +83,7 @@ execute_with_spinner() {
     done
     wait $pid
     local ret=$?
-    printf "\e[?25h" # 恢复光标
+    printf "\e[?25h"
     if [ $ret -eq 0 ]; then
         printf "\r\033[K ${GREEN}[√]${NC} %s... 完成!\n" "$msg"
     else
@@ -157,7 +159,6 @@ open_port() {
             added=true
         fi
     fi
-    # 减少冗余输出，提升UI整洁度
 }
 
 check_port_occupied() {
@@ -498,22 +499,35 @@ install_qbit() {
     
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
         INSTALLED_MAJOR_VER="4"
-        log_info "锁定版本: 4.x (绑定 libtorrent v1.2.x)"
+        log_info "锁定版本: 4.x (绑定 libtorrent v1.2.20) -> 使用个人静态库"
         [[ "$arch" == "x86_64" ]] && url="$URL_V4_AMD64" || url="$URL_V4_ARM64"
+        
+    elif [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "5.0.4" ]]; then
+        INSTALLED_MAJOR_VER="5"
+        log_info "锁定版本: 5.x (绑定 libtorrent v2.0.11 支持 mmap) -> 使用个人静态库"
+        [[ "$arch" == "x86_64" ]] && url="$URL_V5_AMD64" || url="$URL_V5_ARM64"
+        
     else
         INSTALLED_MAJOR_VER="5"
-        log_info "锁定版本: 5.x (支持 mmap 高级内存管理)"
+        log_info "请求动态版本: $QB_VER_REQ -> 正在连接 GitHub API..."
+        
         local tag=""
-        if [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "latest" ]]; then
-            tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
+        if [[ "$QB_VER_REQ" == "latest" ]]; then
+            tag=$(curl -sL --max-time 10 "$api" | jq -r '.[0].tag_name' 2>/dev/null || echo "null")
         else
-            tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
-            if [[ -z "$tag" || "$tag" == "null" ]]; then
-                log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
-            fi
+            tag=$(curl -sL --max-time 10 "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' 2>/dev/null | head -n 1 || echo "null")
         fi
-        local fname="${arch}-qbittorrent-nox"
-        url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
+        
+        # API 防灾兜底机制
+        if [[ -z "$tag" || "$tag" == "null" ]]; then
+            log_warn "GitHub API 获取失败或受限，触发本地仓库兜底机制！"
+            log_info "已自动降级为您个人的稳定内置版本: 5.0.4"
+            [[ "$arch" == "x86_64" ]] && url="$URL_V5_AMD64" || url="$URL_V5_ARM64"
+        else
+            log_info "成功获取上游指定版本: $tag"
+            local fname="${arch}-qbittorrent-nox"
+            url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
+        fi
     fi
     
     download_file "$url" "/usr/bin/qbittorrent-nox"
@@ -767,7 +781,7 @@ echo -e "${CYAN}       / _ | / __/ |/ _ \\ ${NC}"
 echo -e "${CYAN}      / __ |_\\ \\  / ___/ ${NC}"
 echo -e "${CYAN}     /_/ |_/___/ /_/     ${NC}"
 echo -e "${BLUE}========================================================${NC}"
-echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v1.6.5 ✦${NC}"
+echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v1.6.6 ✦${NC}"
 echo -e "${PURPLE}   ✦ 作者：Supcutie Github：yimouleng/Auto-Seedbox-PT ✦${NC}"
 echo -e "${BLUE}========================================================${NC}"
 echo ""
