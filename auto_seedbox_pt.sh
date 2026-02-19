@@ -477,7 +477,7 @@ EOF
     log_info "系统核心优化 (模式 $TUNE_MODE, TCP: $target_cc) 已应用完毕。"
 }
 
-# ================= 5. 应用部署逻辑 (核心修正部分) =================
+# ================= 5. 应用部署逻辑 (核心修正版) =================
 
 install_qbit() {
     print_banner "部署 qBittorrent"
@@ -495,17 +495,21 @@ install_qbit() {
         local tag=""
         if [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "latest" ]]; then
             tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
+            log_info "正在拉取最新版本: $tag"
         else
             tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
+            if [[ -z "$tag" || "$tag" == "null" ]]; then
+                log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
+            fi
+            log_info "正在拉取指定版本: $tag"
         fi
-        [[ -z "$tag" || "$tag" == "null" ]] && log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
         url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${arch}-qbittorrent-nox"
     fi
     
     download_file "$url" "/usr/bin/qbittorrent-nox"
     chmod +x /usr/bin/qbittorrent-nox
-    
-    # ⚠️ 修复关键：在写入配置前，必须彻底杀死所有 qB 进程并清理锁文件，防止 QtLockedFile 报错和配置回刷
+
+    # ⚠️ 修正：彻底清理进程与文件锁，创建数据库必需目录
     log_info "深度清理残留进程与文件锁..."
     systemctl stop "qbittorrent-nox@$APP_USER" 2>/dev/null || true
     pkill -9 -u "$APP_USER" qbittorrent-nox 2>/dev/null || true
@@ -523,12 +527,12 @@ install_qbit() {
 
     local threads_val="4"; local cache_val="$QB_CACHE"
 
-    # ======== 修正 Section 归属与参数命名 (兼容 4.x 和 5.x) ========
+    # ======== 核心修复：修正 Section 归属与参数命名 (兼容 4.x 和 5.x) ========
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
         cache_val="-1" # 5.x 使用 mmap
         threads_val="0"
         
-        # 5.x 专用分区逻辑
+        # 5.x 正确分区逻辑
         cat > "$config_file" << EOF
 [Preferences]
 Downloads\SavePath=$HB/Downloads/
@@ -605,7 +609,7 @@ Bittorrent\MaxSeedingTime=-1
 EOF
     fi
 
-    # 强力权限覆盖，确保服务能够读写配置和数据库
+    # 强力权限覆盖与格式清理
     sed -i '/^$/d' "$config_file"
     chown -R "$APP_USER:$APP_USER" "$HB/.config" "$HB/.local" "$HB/Downloads"
     chmod -R 755 "$HB/.config" "$HB/.local"
@@ -636,7 +640,12 @@ install_apps() {
     
     if ! command -v docker >/dev/null; then
         log_info "使用官方脚本安装 Docker..."
-        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh >/dev/null 2>&1 || {
+            log_warn "官方脚本安装失败，尝试回退到 APT 安装..."
+            apt-get update && apt-get install -y docker.io
+        }
+        rm -f get-docker.sh
     fi
 
     if [[ "$DO_VX" == "true" ]]; then
@@ -654,6 +663,7 @@ install_apps() {
             eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/\"" || true
             need_init=false
         elif [[ -f "$HB/vertex/data/setting.json" ]]; then
+             log_info "检测到已有配置，跳过初始化等待..."
              need_init=false
         fi
 
@@ -669,7 +679,7 @@ install_apps() {
             done
             echo ""
             
-            # 按需补全逻辑
+            # ⚠️ 修复：按需补全逻辑
             if [ ! -d "$HB/vertex/data/site" ]; then
                 log_info "补全核心目录结构..."
                 mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
@@ -692,6 +702,7 @@ install_apps() {
                          jq --arg url "http://$gw:$QB_WEB_PORT" --arg user "$APP_USER" --arg pass "$APP_PASS" '.clientUrl = $url | .username = $user | .password = $pass' "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
                     fi
                 done
+                log_info "连接信息已修正。"
             fi
             shopt -u nullglob
         fi
@@ -699,6 +710,7 @@ install_apps() {
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$HB/vertex/data/setting.json"
         if [[ -f "$set_file" ]]; then
+            log_info "同步面板访问配置..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && mv "${set_file}.tmp" "$set_file"
         else
             cat > "$set_file" << EOF
@@ -713,6 +725,7 @@ EOF
     if [[ "$DO_FB" == "true" ]]; then
         print_banner "部署 FileBrowser"
         rm -rf "$HB/.config/filebrowser" "$HB/fb.db"; mkdir -p "$HB/.config/filebrowser" && touch "$HB/fb.db" && chmod 666 "$HB/fb.db"
+        chown -R "$APP_USER:$APP_USER" "$HB/.config/filebrowser" "$HB/fb.db"
         docker rm -f filebrowser &>/dev/null || true
         docker run --rm --user 0:0 -v "$HB/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest config init
         docker run --rm --user 0:0 -v "$HB/fb.db":/database/filebrowser.db filebrowser/filebrowser:latest users add "$APP_USER" "$APP_PASS" --perm.admin
@@ -749,15 +762,32 @@ if [[ "$ACTION" == "uninstall" ]]; then uninstall ""; elif [[ "$ACTION" == "purg
 check_root
 print_banner "环境初始化"
 
+# =============== 内存硬性防呆机制 (完全恢复原版) ===============
 mem_kb_chk=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 mem_gb_chk=$((mem_kb_chk / 1024 / 1024))
 if [[ "$TUNE_MODE" == "1" && $mem_gb_chk -lt 4 ]]; then
-    echo -e "${RED} [警告] 内存不足 4GB，强制降级为均衡模式！${NC}"
-    TUNE_MODE="2"; sleep 3
+    echo -e "${RED}================================================================${NC}"
+    echo -e "${RED} [警告] 内存防呆机制触发！检测到系统物理内存不足 4GB (当前: ${mem_gb_chk}GB)！${NC}"
+    echo -e "${RED} ⚠️ 极限模式 (分配 1GB TCP 发送/接收缓冲区) 会导致本机瞬间 OOM 死机！${NC}"
+    echo -e "${RED} ⚠️ 已为您强制降级为 Balanced (均衡保种) 模式！${NC}"
+    echo -e "${RED}================================================================${NC}"
+    TUNE_MODE="2"
+    sleep 3
 fi
 
+# ⚠️ 重点恢复部分：极限模式警告提示 (完全遵循用户原稿)
 if [[ "$DO_TUNE" == "true" ]]; then
-    [[ "$TUNE_MODE" == "1" ]] && { echo -e "${RED} [警告] 已开启 1 (极限刷流) 模式！${NC}"; sleep 5; } || echo -e "${GREEN} -> 当前系统调优模式: 2 (均衡保种)${NC}"
+    if [[ "$TUNE_MODE" == "1" ]]; then
+        echo -e "${RED}================================================================${NC}"
+        echo -e "${RED} [警告] 您选择了 1 (极限刷流) 调优模式！${NC}"
+        echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区，极大消耗内存！${NC}"
+        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/NVMe 的独立服务器进行首发抢种！${NC}"
+        echo -e "${RED} ⚠️ 家用 NAS、廉价 VPS 保种请终止安装，使用 -m 2 重新运行！${NC}"
+        echo -e "${RED}================================================================${NC}"
+        sleep 5
+    else
+        echo -e "${GREEN} -> 当前系统调优模式: 2 (均衡保种)${NC}"
+    fi
 fi
 
 if [[ -z "$APP_USER" ]]; then APP_USER="admin"; fi
@@ -789,6 +819,7 @@ install_qbit
 
 PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "ServerIP")
 
+# =============== 安装成功输出 (完全恢复原版样式) ===============
 echo ""
 echo -e "${GREEN}########################################################${NC}"
 echo -e "${GREEN}            Auto-Seedbox-PT 安装成功!                     ${NC}"
@@ -797,6 +828,7 @@ echo -e "${GREEN}########################################################${NC}"
 echo -e "🧩 qBittorrent: ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 
 if [[ "$DO_VX" == "true" ]]; then
+    VX_IN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vertex 2>/dev/null || echo "Unknown")
     VX_GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
     echo -e "🌐 Vertex:       ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
     echo -e "    └─ 下载器连接填写: ${YELLOW}$VX_GW:$QB_WEB_PORT${NC}"
