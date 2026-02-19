@@ -216,7 +216,7 @@ uninstall() {
         log_info "仅卸载服务，保留用户数据与内核优化。"
     fi
 
-    read -p "确认要卸载所有组件吗？此操作不可逆！ [y/n]: " confirm < /dev/tty
+    read -p "确认要卸载核心组件吗？此操作不可逆！ [y/N]: " confirm < /dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
 
     log_info "1. 停止并移除服务..."
@@ -278,7 +278,6 @@ uninstall() {
     fi
     
     # 彻底清理所有受支持防火墙的规则
-    # 1. UFW
     if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
         ufw delete allow $QB_WEB_PORT/tcp >/dev/null 2>&1 || true
         ufw delete allow $QB_BT_PORT/tcp >/dev/null 2>&1 || true
@@ -286,7 +285,6 @@ uninstall() {
         ufw delete allow $VX_PORT/tcp >/dev/null 2>&1 || true
         ufw delete allow $FB_PORT/tcp >/dev/null 2>&1 || true
     fi
-    # 2. Firewalld
     if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then
         firewall-cmd --zone=public --remove-port="$QB_WEB_PORT/tcp" --permanent >/dev/null 2>&1
         firewall-cmd --zone=public --remove-port="$QB_BT_PORT/tcp" --permanent >/dev/null 2>&1
@@ -295,7 +293,6 @@ uninstall() {
         firewall-cmd --zone=public --remove-port="$FB_PORT/tcp" --permanent >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
     fi
-    # 3. iptables
     if command -v iptables >/dev/null; then
         iptables -D INPUT -p tcp --dport $QB_WEB_PORT -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p tcp --dport $QB_BT_PORT -j ACCEPT 2>/dev/null || true
@@ -316,7 +313,21 @@ uninstall() {
         log_warn "4. 清理配置文件..."
         if [[ -d "$target_home" ]]; then
              rm -rf "$target_home/.config/qBittorrent" "$target_home/vertex" "$target_home/.config/filebrowser"
-             log_info "已清理 $target_home 下的相关配置。"
+             log_info "已清理 $target_home 下的配置文件。"
+             
+             # 新增：交互式询问是否删除下载数据目录
+             if [[ -d "$target_home/Downloads" ]]; then
+                 echo -e "${YELLOW}=================================================${NC}"
+                 log_warn "检测到可能包含大量数据的目录: $target_home/Downloads"
+                 read -p "是否连同已下载的种子数据一并彻底删除？此操作不可逆！ [y/N]: " del_data < /dev/tty
+                 if [[ "$del_data" =~ ^[Yy]$ ]]; then
+                     rm -rf "$target_home/Downloads"
+                     log_info "💣 已彻底删除 $target_home/Downloads 数据目录。"
+                 else
+                     log_info "🛡️ 已为您安全保留 $target_home/Downloads 数据目录。"
+                 fi
+                 echo -e "${YELLOW}=================================================${NC}"
+             fi
         fi
         rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser"
         log_warn "建议重启服务器 (reboot) 以彻底清理内核内存驻留。"
