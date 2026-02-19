@@ -721,7 +721,7 @@ EOF
         chown -R "$APP_USER:$APP_USER" "$HB/vertex"
         chmod -R 777 "$HB/vertex/data"
 
-        execute_with_spinner "拉取 Vertex 镜像" docker pull lswl/vertex:stable
+        execute_with_spinner "拉取 Vertex 镜像 (文件较大，视网络情况约需 1~3 分钟)" docker pull lswl/vertex:stable
         execute_with_spinner "启动 Vertex 容器" docker run -d --name vertex --restart unless-stopped -p $VX_PORT:3000 -v "$HB/vertex":/vertex -e TZ=Asia/Shanghai lswl/vertex:stable
         open_port "$VX_PORT"
     fi
@@ -891,7 +891,8 @@ install_qbit
 PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "ServerIP")
 
 # ================= 极简极客版终端 Dashboard =================
-clear
+echo ""
+echo ""
 VX_GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
 
 cat << EOF
