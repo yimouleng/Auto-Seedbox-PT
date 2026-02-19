@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.6 
+# Auto-Seedbox-PT (ASP) v1.6.5 (Ultimate Dashboard Edition)
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
@@ -14,7 +14,7 @@
 #   -t : 启用系统内核优化（强烈推荐）
 #   -m : 调优模式 (1: 极限刷流 / 2: 均衡保种) [默认 1]
 #   -o : 自定义端口 (会提示输入)
-#   -d : Vertex data 目录 ZIP 下载链接 (可选)
+#   -d : Vertex data 目录 ZIP/tar.gz 下载链接 (可选)
 #   -k : Vertex data ZIP 解压密码 (可选)
 ################################################################################
 
@@ -25,7 +25,9 @@ IFS=$'\n\t'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 QB_WEB_PORT=8080
@@ -75,9 +77,9 @@ download_file() {
 }
 
 print_banner() {
-    echo -e "${BLUE}------------------------------------------------${NC}"
-    echo -e "${BLUE}    Auto-Seedbox-PT  >>  $1${NC}"
-    echo -e "${BLUE}------------------------------------------------${NC}"
+    echo -e "${CYAN}------------------------------------------------${NC}"
+    echo -e "${CYAN}    Auto-Seedbox-PT  >>  $1${NC}"
+    echo -e "${CYAN}------------------------------------------------${NC}"
 }
 
 check_root() { 
@@ -775,7 +777,8 @@ echo -e "${CYAN}      / _ | / __/ |/ _ \\ ${NC}"
 echo -e "${CYAN}     / __ |_\\ \\  / ___/ ${NC}"
 echo -e "${CYAN}    /_/ |_/___/ /_/      ${NC}"
 echo -e "${BLUE}========================================================${NC}"
-echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v1.6.4 ✦${NC}"
+echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v1.6.5 ✦${NC}"
+echo -e "${PURPLE}   ✦ 作者：Supcutie Github：yimouleng/Auto-Seedbox-PT ✦${NC}"
 echo -e "${BLUE}========================================================${NC}"
 echo ""
 
