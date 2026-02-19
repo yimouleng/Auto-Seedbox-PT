@@ -1,9 +1,21 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.6.3 (Ultimate Fix Edition)
+# Auto-Seedbox-PT (ASP) v1.6 (Extreme Tuning & Version Lock Edition)
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
+# 参数说明:
+#   -u : 用户名 (用于运行服务和登录WebUI)
+#   -p : 密码（必须 ≥ 8 位）
+#   -c : qBittorrent 缓存大小 (MiB, 仅4.x有效, 5.x使用mmap)
+#   -q : qBittorrent 版本 (4.3.9, 5, latest, 或精确小版本如 5.0.4)
+#   -v : 安装 Vertex
+#   -f : 安装 FileBrowser
+#   -t : 启用系统内核优化（强烈推荐）
+#   -m : 调优模式 (1: 极限刷流 / 2: 均衡保种) [默认 1]
+#   -o : 自定义端口 (会提示输入)
+#   -d : Vertex data 目录 ZIP 下载链接 (可选)
+#   -k : Vertex data ZIP 解压密码 (可选)
 ################################################################################
 
 set -euo pipefail
@@ -626,15 +638,26 @@ install_apps() {
         local set_file="$HB/vertex/data/setting.json"
         local need_init=true
 
-        # 2. 判断并处理数据恢复
+        # 2. 判断并处理数据恢复 (支持 zip 与原生 tar.gz 双格式自适应)
         if [[ -n "$VX_RESTORE_URL" ]]; then
             log_info "下载备份数据..."
-            download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
-            local unzip_cmd="unzip -o"
-            [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
+            local is_tar=false
+            if [[ "$VX_RESTORE_URL" == *.tar.gz* || "$VX_RESTORE_URL" == *.tgz* ]]; then
+                is_tar=true
+                download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.tar.gz"
+            else
+                download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
+            fi
             
-            # 【修复点】精确解压到 data/ 目录下
-            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/data/\"" || true
+            if [[ "$is_tar" == "true" ]]; then
+                log_info "检测到原生 tar.gz 备份包，正在解压至 data 目录..."
+                tar -xzf "$TEMP_DIR/bk.tar.gz" -C "$HB/vertex/data/" || true
+            else
+                log_info "检测到 zip 备份包，正在解压至 data 目录..."
+                local unzip_cmd="unzip -o"
+                [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
+                eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/data/\"" || true
+            fi
             need_init=false
         elif [[ -f "$set_file" ]]; then
             log_info "检测到本地已有配置，执行原地接管..."
