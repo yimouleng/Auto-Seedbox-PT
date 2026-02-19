@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.4 (Extreme Tuning & Version Lock Edition)
+# Auto-Seedbox-PT (ASP) v1.5 (Extreme Tuning & Version Lock Edition)
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
@@ -36,7 +36,7 @@ FB_PORT=8081
 APP_USER="admin"
 APP_PASS=""
 QB_CACHE=1024
-QB_VER_REQ="5" 
+QB_VER_REQ="5.0.4" 
 DO_VX=false
 DO_FB=false
 DO_TUNE=false
@@ -76,7 +76,7 @@ download_file() {
 
 print_banner() {
     echo -e "${BLUE}------------------------------------------------${NC}"
-    echo -e "${BLUE}   Auto-Seedbox-PT  >>  $1${NC}"
+    echo -e "${BLUE}    Auto-Seedbox-PT  >>  $1${NC}"
     echo -e "${BLUE}------------------------------------------------${NC}"
 }
 
@@ -527,6 +527,23 @@ install_qbit() {
     local threads_val="4"; local cache_val="$QB_CACHE"
     local config_extra=""
 
+    # 提取出独立的 PT 必备参数 (强制屏蔽吸血和隐私泄露，无论 4.x 还是 5.x 均适用)
+    local config_pt_prefs="BitTorrent\DHTEnabled=false
+BitTorrent\PeXEnabled=false
+BitTorrent\LSDEnabled=false
+Queueing\QueueingEnabled=false
+Connection\GlobalDLLimit=0
+Connection\GlobalUPLimit=0
+Connection\MaxConnections=0
+Connection\MaxConnectionsPerTorrent=0
+Connection\MaxUploads=0
+Connection\MaxUploadsPerTorrent=0
+Advanced\AnnounceToAllTrackers=true
+Advanced\AnnounceToAllTiers=true
+BitTorrent\MaxRatioAction=0
+BitTorrent\MaxRatio=-1
+BitTorrent\MaxSeedingTime=-1"
+
     # 动态生成性能配置 (注意：此处前导不能有空格，严格遵循 INI 格式)
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
         cache_val="-1" # 5.x 禁用内存缓存，拥抱 mmap
@@ -557,13 +574,12 @@ Advanced\SendBufferLowWatermark=3072"
         fi
     fi
 
-    # 写入 conf 保证严格换行
+    # 写入 conf 保证严格换行 (将调优参数合规移交至 [Preferences] 层级下)
     cat > "$HB/.config/qBittorrent/qBittorrent.conf" << EOF
 [BitTorrent]
 Session\DefaultSavePath=$HB/Downloads/
-Session\AsyncIOThreadsCount=$threads_val
-$config_extra
 [Preferences]
+Session\AsyncIOThreadsCount=$threads_val
 Connection\PortRangeMin=$QB_BT_PORT
 Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
@@ -575,6 +591,8 @@ WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
 WebUI\HTTPS\Enabled=false
+$config_pt_prefs
+$config_extra
 EOF
     # 清理可能产生的空行
     sed -i '/^$/d' "$HB/.config/qBittorrent/qBittorrent.conf"
@@ -641,6 +659,9 @@ install_apps() {
             -v "$HB/vertex":/vertex \
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable
+
+        log_info "等待 5 秒以让容器生成初始配置目录..."
+        sleep 5
 
         if [[ "$need_init" == "true" ]]; then
             log_info "等待容器初始化目录结构..."
@@ -779,8 +800,8 @@ if [[ "$DO_TUNE" == "true" ]]; then
         echo -e "${RED}================================================================${NC}"
         echo -e "${RED} [警告] 您选择了 1 (极限刷流) 调优模式！${NC}"
         echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区，极大消耗内存！${NC}"
-        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/SSD 的独立服务器进行极限刷流抢种！${NC}"
-        echo -e "${RED} ⚠️ 家用 NAS、或者只想保种刷流请终止安装，使用 -m 2 重新运行！${NC}"
+        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/NVMe 的独立服务器进行首发抢种！${NC}"
+        echo -e "${RED} ⚠️ 家用 NAS、廉价 VPS 保种请终止安装，使用 -m 2 重新运行！${NC}"
         echo -e "${RED}================================================================${NC}"
         sleep 5
     else
