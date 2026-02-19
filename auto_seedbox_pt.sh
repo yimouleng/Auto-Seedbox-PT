@@ -524,7 +524,7 @@ install_qbit() {
     # 【修复要点1】：强制注入 [LegalNotice] 免除首次启动交互式拦截
     # 【修复要点2】：严格遵循 Qt 大小写规范，将协议开关键名统一修正为 BitTorrent\ 
     
-    cat > "$config_file" << EOF
+   cat > "$config_file" << EOF
 [LegalNotice]
 Accepted=true
 EOF
@@ -533,6 +533,7 @@ EOF
         cat >> "$config_file" << EOF
 [Preferences]
 Downloads\SavePath=$HB/Downloads/
+Session\MemoryWorkingSetLimit=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -545,19 +546,19 @@ WebUI\HTTPS\Enabled=false
 Connection\PortRangeMin=$QB_BT_PORT
 Connection\GlobalDLLimit=-1
 Connection\GlobalUPLimit=-1
-Connection\MaxConnections=-1
-Connection\MaxConnectionsPerTorrent=-1
-Connection\MaxUploads=-1
-Connection\MaxUploadsPerTorrent=-1
 Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
-BitTorrent\DHTEnabled=false
-BitTorrent\PeXEnabled=false
-BitTorrent\LSDEnabled=false
-BitTorrent\MaxRatioAction=0
-BitTorrent\MaxRatio=-1
-BitTorrent\MaxSeedingTime=-1
+Bittorrent\DHT=false
+Bittorrent\PeX=false
+Bittorrent\LSD=false
+Bittorrent\MaxConnecs=-1
+Bittorrent\MaxConnecsPerTorrent=-1
+Bittorrent\MaxUploads=-1
+Bittorrent\MaxUploadsPerTorrent=-1
+Bittorrent\MaxRatioAction=0
+Bittorrent\MaxRatio=-1
+Bittorrent\MaxSeedingTime=-1
 EOF
 
         if [[ "$TUNE_MODE" == "1" ]]; then
@@ -593,20 +594,20 @@ WebUI\HTTPS\Enabled=false
 Connection\PortRangeMin=$QB_BT_PORT
 Connection\GlobalDLLimit=-1
 Connection\GlobalUPLimit=-1
-Connection\MaxConnections=-1
-Connection\MaxConnectionsPerTorrent=-1
-Connection\MaxUploads=-1
-Connection\MaxUploadsPerTorrent=-1
 Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
 Session\AsyncIOThreadsCount=$threads_val
-BitTorrent\DHTEnabled=false
-BitTorrent\PeXEnabled=false
-BitTorrent\LSDEnabled=false
-BitTorrent\MaxRatioAction=0
-BitTorrent\MaxRatio=-1
-BitTorrent\MaxSeedingTime=-1
+Bittorrent\DHT=false
+Bittorrent\PeX=false
+Bittorrent\LSD=false
+Bittorrent\MaxConnecs=-1
+Bittorrent\MaxConnecsPerTorrent=-1
+Bittorrent\MaxUploads=-1
+Bittorrent\MaxUploadsPerTorrent=-1
+Bittorrent\MaxRatioAction=0
+Bittorrent\MaxRatio=-1
+Bittorrent\MaxSeedingTime=-1
 EOF
 
         if [[ "$TUNE_MODE" == "1" ]]; then
