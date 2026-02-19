@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.6 (Extreme Tuning & Version Lock Edition)
+# Auto-Seedbox-PT (ASP) v1.6 
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
@@ -766,70 +766,121 @@ elif [[ "$ACTION" == "purge" ]]; then
     uninstall "--purge"
 fi
 
-print_banner "环境初始化与前置检测"
+# ================= 开始全新极客仪表盘 UI =================
+clear # 清屏，营造 Dashboard 的沉浸感
 
+# 紫色与青色的酷炫 ASCII 头部
+echo -e "${CYAN}       ___   _____  ___  ${NC}"
+echo -e "${CYAN}      / _ | / __/ |/ _ \\ ${NC}"
+echo -e "${CYAN}     / __ |_\\ \\  / ___/ ${NC}"
+echo -e "${CYAN}    /_/ |_/___/ /_/      ${NC}"
+echo -e "${BLUE}========================================================${NC}"
+echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v1.6.4 ✦${NC}"
+echo -e "${BLUE}========================================================${NC}"
+echo ""
+
+echo -e " ${CYAN}╔══════════════════ 环境预检 ══════════════════╗${NC}"
+echo ""
+
+# 1. 权限检测
+if [[ $EUID -ne 0 ]]; then
+    echo -e "  检查 Root 权限...... [${RED}X${NC}] 拒绝通行"
+    echo ""
+    log_err "权限不足：请使用 root 用户运行本脚本！"
+else
+    echo -e "  检查 Root 权限...... [${GREEN}√${NC}] 通行"
+fi
+
+# 2. 内存检测与智能防呆融合
 mem_kb_chk=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 mem_gb_chk=$((mem_kb_chk / 1024 / 1024))
+tune_downgraded=false
 if [[ "$TUNE_MODE" == "1" && $mem_gb_chk -lt 4 ]]; then
-    echo -e "${RED}================================================================${NC}"
-    echo -e "${RED} [拦截] 内存防呆机制触发！检测到系统物理内存不足 4GB (当前: ${mem_gb_chk}GB)！${NC}"
-    echo -e "${RED} ⚠️ 极限模式 (分配 1GB TCP 发送/接收缓冲区) 会导致本机瞬间 OOM 死机！${NC}"
-    echo -e "${RED} ⚠️ 已为您强制降级为 Balanced (均衡保种) 模式！${NC}"
-    echo -e "${RED}================================================================${NC}"
     TUNE_MODE="2"
-    sleep 3
+    tune_downgraded=true
+    echo -e "  检测 物理内存....... [${RED}!${NC}] ${mem_gb_chk} GB ${RED}(不足4G,触发降级保护)${NC}"
+else
+    echo -e "  检测 物理内存....... [${GREEN}√${NC}] ${mem_gb_chk} GB"
 fi
 
+# 3. 架构与内核检测
+arch_chk=$(uname -m)
+echo -e "  检测 系统架构....... [${GREEN}√${NC}] ${arch_chk}"
+kernel_chk=$(uname -r)
+echo -e "  检测 内核版本....... [${GREEN}√${NC}] ${kernel_chk}"
+
+# 4. 网络检测
+if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    echo -e "  检测 网络连通性..... [${GREEN}🌐${NC}] 正常"
+else
+    echo -e "  检测 网络连通性..... [${YELLOW}!${NC}] 异常 (后续拉取依赖可能失败)"
+fi
+
+# 5. DPKG 锁检测 (静默等待)
+echo -n -e "  检查 DPKG 锁状态.... "
+wait_for_lock_silent() {
+    local max_wait=60; local waited=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+        echo -n "."
+        sleep 1; waited=$((waited + 1))
+        [[ $waited -ge $max_wait ]] && break
+    done
+}
+wait_for_lock_silent
+echo -e "[${GREEN}√${NC}] 就绪"
+
+echo ""
+echo -e " ${GREEN}√ 环境预检通过${NC}"
+echo ""
+
+echo -e " ${CYAN}╔══════════════════ 模式配置 ══════════════════╗${NC}"
+echo ""
+
+# 模式确认与风险提示
 if [[ "$DO_TUNE" == "true" ]]; then
     if [[ "$TUNE_MODE" == "1" ]]; then
-        echo -e "${RED}================================================================${NC}"
-        echo -e "${RED} [警告] 您选择了 1 (极限刷流) 调优模式！${NC}"
-        echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区，极大消耗内存！${NC}"
-        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/SSD 的独立服务器进行极限刷流抢种！${NC}"
-        echo -e "${RED} ⚠️ 家用 NAS、或者只想保种刷流请终止安装，使用 -m 2 重新运行！${NC}"
-        echo -e "${RED}================================================================${NC}"
-        
-        echo -e "${YELLOW}请仔细阅读以上高危警告，3秒后开始执行底层环境检测...${NC}"
+        echo -e "  当前选定模式: ${RED}极限刷流 (Mode 1)${NC}"
+        echo -e "  推荐场景:     ${YELLOW}大内存/G口/万兆独服抢种${NC}"
+        echo -e "  风险提示:     ${RED}会锁定CPU高频并暴增内核缓冲区，极大消耗内存！${NC}"
+        echo ""
+        echo -e "  ${YELLOW}请确认上方风险，3秒后开始部署依赖...${NC}"
         sleep 3
     else
-        echo -e "${GREEN} -> 当前系统调优模式: 2 (均衡保种)${NC}"
+        echo -e "  当前选定模式: ${GREEN}均衡保种 (Mode 2)${NC}"
+        echo -e "  推荐场景:     ${GREEN}家用NAS/普通VPS稳定保种${NC}"
+        if [[ "$tune_downgraded" == "true" ]]; then
+            echo -e "  ${YELLOW}※ 已触发防呆机制，为您强制降级至此模式以防 OOM 死机。${NC}"
+        fi
+        echo ""
     fi
+else
+     echo -e "  当前选定模式: ${GREEN}默认 (未开启系统内核调优)${NC}"
+     echo ""
 fi
 
+echo -e " ${CYAN}========================================================${NC}"
+echo ""
+
+# 补全用户交互信息
 if [[ -z "$APP_USER" ]]; then APP_USER="admin"; fi
 if [[ -n "$APP_PASS" ]]; then validate_pass "$APP_PASS"; fi
 
-echo ""
-log_info "-> [1/4] 检测系统基础架构与资源..."
-arch_chk=$(uname -m); kernel_chk=$(uname -r)
-echo -e "   架构: ${arch_chk} | 内核: ${kernel_chk} | 物理内存: ${mem_gb_chk} GB"
-sleep 1 
-
-log_info "-> [2/4] 验证管理员权限与网络连通性..."
-check_root
-if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-    echo -e "   网络连通性: 正常"
-else
-    log_warn "   网络连通性异常，后续依赖拉取可能失败！"
-fi
-
-log_info "-> [3/4] 检查系统包管理器状态 (等待 apt/dpkg 锁释放)..."
-wait_for_lock
-echo -e "   包管理器: 就绪 (无占用)"
-
-log_info "-> [4/4] 更新软件源并安装核心依赖 (curl, jq, unzip, python3...)"
-export DEBIAN_FRONTEND=noninteractive
-apt-get -qq update && apt-get -qq install -y curl wget jq unzip python3 net-tools ethtool iptables >/dev/null
-echo -e "${GREEN} [就绪] 基础环境初始化与依赖部署完成！${NC}\n"
-
 if [[ -z "$APP_PASS" ]]; then
     while true; do
-        echo -n "请输入 Web 面板统一密码 (必须 ≥ 8 位): "
+        echo -n -e "  ▶ 请输入 Web 面板统一密码 (必须 ≥ 8 位): "
         read -s APP_PASS < /dev/tty; echo ""
         if [[ ${#APP_PASS} -ge 8 ]]; then break; fi
         log_warn "密码过短，请重新输入！"
     done
+    echo ""
 fi
+
+# 开始静默部署依赖
+log_info "正在静默更新软件源并安装核心依赖 (curl, jq, unzip, tar...)"
+export DEBIAN_FRONTEND=noninteractive
+apt-get -qq update && apt-get -qq install -y curl wget jq unzip tar python3 net-tools ethtool iptables >/dev/null
+echo -e "${GREEN} [√] 依赖部署完成！${NC}\n"
+# ================= 极客仪表盘 UI 结束 =================
 
 if [[ "$CUSTOM_PORT" == "true" ]]; then
     echo -e "${BLUE}=======================================${NC}"
