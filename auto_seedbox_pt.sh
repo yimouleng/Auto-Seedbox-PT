@@ -228,14 +228,11 @@ uninstall() {
     pkill -9 qbittorrent-nox 2>/dev/null || true
     rm -f /usr/bin/qbittorrent-nox
 
-    log_info "2. 清理 Docker 资源..."
+    log_info "2. 清理 Docker 资源 (精准移除)..."
     if command -v docker >/dev/null; then
         docker rm -f vertex filebrowser 2>/dev/null || true
         docker rmi lswl/vertex:stable filebrowser/filebrowser:latest 2>/dev/null || true
         docker network prune -f >/dev/null 2>&1 || true
-        if [[ "$mode" == "--purge" ]]; then
-            docker system prune -af --volumes >/dev/null 2>&1 || true
-        fi
     fi
 
     log_info "3. 移除系统优化与内核回滚..."
@@ -252,10 +249,14 @@ uninstall() {
         for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
             [ -f "$f" ] && echo "schedutil" > "$f" 2>/dev/null || echo "ondemand" > "$f" 2>/dev/null || true
         done
-        # 恢复常用网卡队形
+        # 恢复常用网卡队列和拥塞窗口
         ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
         if [ -n "$ETH" ]; then
             ifconfig "$ETH" txqueuelen 1000 2>/dev/null || true
+        fi
+        DEF_ROUTE=$(ip -o -4 route show to default | head -n1)
+        if [[ -n "$DEF_ROUTE" ]]; then
+            ip route change $DEF_ROUTE initcwnd 10 initrwnd 10 2>/dev/null || true
         fi
         # 暴力恢复基础 Sysctl 参数
         sysctl -w net.core.rmem_max=212992 >/dev/null 2>&1 || true
@@ -267,13 +268,36 @@ uninstall() {
         sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
     fi
     
-    # 移除防火墙规则
+    # 彻底清理所有受支持防火墙的规则
+    # 1. UFW
+    if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
+        ufw delete allow $QB_WEB_PORT/tcp >/dev/null 2>&1 || true
+        ufw delete allow $QB_BT_PORT/tcp >/dev/null 2>&1 || true
+        ufw delete allow $QB_BT_PORT/udp >/dev/null 2>&1 || true
+        ufw delete allow $VX_PORT/tcp >/dev/null 2>&1 || true
+        ufw delete allow $FB_PORT/tcp >/dev/null 2>&1 || true
+    fi
+    # 2. Firewalld
+    if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then
+        firewall-cmd --zone=public --remove-port="$QB_WEB_PORT/tcp" --permanent >/dev/null 2>&1
+        firewall-cmd --zone=public --remove-port="$QB_BT_PORT/tcp" --permanent >/dev/null 2>&1
+        firewall-cmd --zone=public --remove-port="$QB_BT_PORT/udp" --permanent >/dev/null 2>&1
+        firewall-cmd --zone=public --remove-port="$VX_PORT/tcp" --permanent >/dev/null 2>&1
+        firewall-cmd --zone=public --remove-port="$FB_PORT/tcp" --permanent >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+    fi
+    # 3. iptables
     if command -v iptables >/dev/null; then
         iptables -D INPUT -p tcp --dport $QB_WEB_PORT -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p tcp --dport $QB_BT_PORT -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p udp --dport $QB_BT_PORT -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p tcp --dport $VX_PORT -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p tcp --dport $FB_PORT -j ACCEPT 2>/dev/null || true
+        if command -v netfilter-persistent >/dev/null; then
+            netfilter-persistent save >/dev/null 2>&1
+        elif command -v iptables-save >/dev/null; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
     fi
 
     systemctl daemon-reload
@@ -688,9 +712,9 @@ if [[ "$DO_TUNE" == "true" ]]; then
     if [[ "$TUNE_MODE" == "1" ]]; then
         echo -e "${RED}================================================================${NC}"
         echo -e "${RED} [警告] 您选择了 1 (极限刷流) 调优模式！${NC}"
-        echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区等，极大消耗内存！${NC}"
-        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/SSD 的独立服务器进行首发抢种极限刷流！${NC}"
-        echo -e "${RED} ⚠️ 如果是保种刷流或者家用NAS等请终止安装，使用 -m 2 重新运行！${NC}"
+        echo -e "${RED} ⚠️ 此模式会锁定 CPU 最高频率、暴增内核网络缓冲区，极大消耗内存！${NC}"
+        echo -e "${RED} ⚠️ 仅推荐用于 大内存/G口/NVMe 的独立服务器进行首发抢种！${NC}"
+        echo -e "${RED} ⚠️ 家用 NAS、廉价 VPS 保种请终止安装，使用 -m 2 重新运行！${NC}"
         echo -e "${RED}================================================================${NC}"
         sleep 5
     else
