@@ -186,7 +186,7 @@ setup_user() {
     log_info "工作目录设定为: $HB"
 }
 
-# ================= 3. 深度卸载逻辑 (彻底回滚) =================
+# ================= 3. 深度卸载逻辑 =================
 
 uninstall() {
     local mode=$1
@@ -228,7 +228,7 @@ uninstall() {
     pkill -9 qbittorrent-nox 2>/dev/null || true
     rm -f /usr/bin/qbittorrent-nox
 
-    log_info "2. 清理 Docker 资源 (精准移除)..."
+    log_info "2. 清理 Docker 资源..."
     if command -v docker >/dev/null; then
         docker rm -f vertex filebrowser 2>/dev/null || true
         docker rmi lswl/vertex:stable filebrowser/filebrowser:latest 2>/dev/null || true
@@ -244,8 +244,7 @@ uninstall() {
     fi
     
     if [[ "$mode" == "--purge" ]]; then
-        log_warn "执行底层状态回滚 (CPU调度器 / 网卡队列 / TCP参数)..."
-        # 智能恢复 CPU Governor 原始状态
+        log_warn "执行底层状态回滚..."
         if [ -f /etc/asp_original_governor ]; then
             orig_gov=$(cat /etc/asp_original_governor)
             for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -258,7 +257,6 @@ uninstall() {
             done
         fi
         
-        # 恢复常用网卡队列和拥塞窗口
         ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
         if [ -n "$ETH" ]; then
             ifconfig "$ETH" txqueuelen 1000 2>/dev/null || true
@@ -267,7 +265,6 @@ uninstall() {
         if [[ -n "$DEF_ROUTE" ]]; then
             ip route change $DEF_ROUTE initcwnd 10 initrwnd 10 2>/dev/null || true
         fi
-        # 暴力恢复基础 Sysctl 参数
         sysctl -w net.core.rmem_max=212992 >/dev/null 2>&1 || true
         sysctl -w net.core.wmem_max=212992 >/dev/null 2>&1 || true
         sysctl -w net.ipv4.tcp_rmem="4096 87380 6291456" >/dev/null 2>&1 || true
@@ -277,7 +274,6 @@ uninstall() {
         sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
     fi
     
-    # 彻底清理所有受支持防火墙的规则
     if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
         ufw delete allow $QB_WEB_PORT/tcp >/dev/null 2>&1 || true
         ufw delete allow $QB_BT_PORT/tcp >/dev/null 2>&1 || true
@@ -315,7 +311,6 @@ uninstall() {
              rm -rf "$target_home/.config/qBittorrent" "$target_home/vertex" "$target_home/.config/filebrowser"
              log_info "已清理 $target_home 下的配置文件。"
              
-             # 新增：交互式询问是否删除下载数据目录
              if [[ -d "$target_home/Downloads" ]]; then
                  echo -e "${YELLOW}=================================================${NC}"
                  log_warn "检测到可能包含大量数据的目录: $target_home/Downloads"
@@ -337,7 +332,7 @@ uninstall() {
     exit 0
 }
 
-# ================= 4. 智能系统优化 (区分极致/均衡) =================
+# ================= 4. 智能系统优化 =================
 
 optimize_system() {
     print_banner "应用智能系统优化 (ASP-Tuned - 模式 $TUNE_MODE)"
@@ -351,13 +346,11 @@ optimize_system() {
     local backlog=65535
     local syn_backlog=65535
     
-    # 动态探测系统可用的拥塞控制算法 (Fallback to BBR)
     local avail_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "bbr cubic reno")
     local target_cc="bbr"
 
-    # 1=极限模式, 2=均衡模式
     if [[ "$TUNE_MODE" == "1" ]]; then
-        rmem_max=1073741824 # 1GB
+        rmem_max=1073741824 
         tcp_wmem="4096 65536 1073741824"
         tcp_rmem="4096 87380 1073741824"
         dirty_ratio=60
@@ -365,7 +358,6 @@ optimize_system() {
         backlog=250000
         syn_backlog=819200
         
-        # BBR 极限算法自动挂载
         if echo "$avail_cc" | grep -qw "bbrx"; then
             target_cc="bbrx"
             log_warn "已侦测到 BBRx 自定义内核，自动挂载抢跑算法！"
@@ -374,14 +366,12 @@ optimize_system() {
             log_warn "已侦测到 BBRv3 内核，自动挂载高级拥塞算法！"
         fi
         
-        # 保存 CPU Governor 原始状态用于无损恢复
         if [ ! -f /etc/asp_original_governor ]; then
             cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null > /etc/asp_original_governor || echo "ondemand" > /etc/asp_original_governor
         fi
         
         log_warn "已启用极限内核参数，为 G口/万兆网卡 提供最大化吞吐支持！"
     else
-        # 均衡模式限制上限
         [[ $rmem_max -gt 134217728 ]] && rmem_max=134217728
         tcp_wmem="4096 65536 $rmem_max"
         tcp_rmem="4096 87380 $rmem_max"
@@ -422,12 +412,10 @@ root soft nofile 1048576
 EOF
     fi
 
-    # 动态生成 asp-tune.sh
     cat > /usr/local/bin/asp-tune.sh << EOF_SCRIPT
 #!/bin/bash
 IS_VIRT=\$(systemd-detect-virt 2>/dev/null || echo "none")
 
-# 极限模式: 锁定 CPU 性能
 if [[ "$TUNE_MODE" == "1" ]]; then
     for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         [ -f "\$f" ] && echo "performance" > "\$f" 2>/dev/null
@@ -484,7 +472,6 @@ install_qbit() {
     local arch=$(uname -m); local url=""
     local api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
     
-    # 智能判断版本库 (4.x 绑 lt12, 5.x 绑 lt20)
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
         INSTALLED_MAJOR_VER="4"
         log_info "锁定版本: 4.x (绑定 libtorrent v1.2.x)"
@@ -498,7 +485,6 @@ install_qbit() {
             tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
             log_info "正在拉取最新版本: $tag"
         else
-            # 精确匹配指定的小版本，如 5.0.4
             tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
             if [[ -z "$tag" || "$tag" == "null" ]]; then
                 log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
@@ -506,7 +492,6 @@ install_qbit() {
             log_info "正在拉取指定版本: $tag"
         fi
         
-        # userdocs 在 5.x 的 release 文件名中不再带有 -lt20 后缀
         local fname="${arch}-qbittorrent-nox"
         url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
     fi
@@ -519,17 +504,88 @@ install_qbit() {
     
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
     
-    # 硬件环境侦测
     local root_disk=$(df $HB | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
     local is_ssd=false
     if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then is_ssd=true; fi
 
     local threads_val="4"; local cache_val="$QB_CACHE"
-    local config_extra=""
+    local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
-    # 提取出独立的 PT 必备参数 (强制屏蔽吸血和隐私泄露，无论 4.x 还是 5.x 均适用)
-    # 核心修复项：全部使用 -1 代表无限制，严格遵循 Bittorrent 大小写
-local config_pt_prefs="Bittorrent\DHTEnabled=false
+    # ======== 核心修复：完全隔离 4.x 和 5.x 的配置生成逻辑 ========
+    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
+        cache_val="-1" # 5.x 禁用内存缓存，拥抱 mmap
+        threads_val="0"
+        
+        cat > "$config_file" << EOF
+[Preferences]
+Downloads\SavePath=$HB/Downloads/
+Downloads\DiskWriteCacheSize=$cache_val
+WebUI\Password_PBKDF2="$pass_hash"
+WebUI\Port=$QB_WEB_PORT
+WebUI\Username=$APP_USER
+WebUI\AuthSubnetWhitelist=127.0.0.1/32, 172.16.0.0/12, 10.0.0.0/8, 192.168.0.0/16, 172.17.0.0/16
+WebUI\AuthSubnetWhitelistEnabled=true
+WebUI\LocalHostAuthenticationEnabled=false
+WebUI\HostHeaderValidation=false
+WebUI\CSRFProtection=false
+WebUI\HTTPS\Enabled=false
+
+[BitTorrent]
+Bittorrent\DHTEnabled=false
+Bittorrent\PeXEnabled=false
+Bittorrent\LSDEnabled=false
+Queueing\QueueingEnabled=false
+Connection\GlobalDLLimit=-1
+Connection\GlobalUPLimit=-1
+Connection\MaxConnections=-1
+Connection\MaxConnectionsPerTorrent=-1
+Connection\MaxUploads=-1
+Connection\MaxUploadsPerTorrent=-1
+Bittorrent\MaxRatioAction=0
+Bittorrent\MaxRatio=-1
+Bittorrent\MaxSeedingTime=-1
+Connection\PortRangeMin=$QB_BT_PORT
+Advanced\AnnounceToAllTrackers=true
+Advanced\AnnounceToAllTiers=true
+Advanced\AsyncIOThreadsCount=$threads_val
+EOF
+
+        if [[ "$TUNE_MODE" == "1" ]]; then
+            cat >> "$config_file" << EOF
+Advanced\DiskIOType=0
+Advanced\DiskIOReadMode=0
+Advanced\DiskIOWriteMode=0
+Advanced\HashingThreadsCount=0
+Connection\MaxHalfOpenConnections=500
+Advanced\SendBufferWatermark=10240
+Advanced\SendBufferLowWatermark=3072
+Advanced\SendBufferTOSMark=2
+EOF
+        fi
+
+    else
+        # 4.x AIO 逻辑
+        if [[ "$is_ssd" == "true" ]]; then 
+            threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16")
+        else
+            threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
+        fi
+        
+        cat > "$config_file" << EOF
+[Preferences]
+Downloads\SavePath=$HB/Downloads/
+Downloads\DiskWriteCacheSize=$cache_val
+WebUI\Password_PBKDF2="$pass_hash"
+WebUI\Port=$QB_WEB_PORT
+WebUI\Username=$APP_USER
+WebUI\AuthSubnetWhitelist=127.0.0.1/32, 172.16.0.0/12, 10.0.0.0/8, 192.168.0.0/16, 172.17.0.0/16
+WebUI\AuthSubnetWhitelistEnabled=true
+WebUI\LocalHostAuthenticationEnabled=false
+WebUI\HostHeaderValidation=false
+WebUI\CSRFProtection=false
+WebUI\HTTPS\Enabled=false
+Connection\PortRangeMin=$QB_BT_PORT
+Bittorrent\DHTEnabled=false
 Bittorrent\PeXEnabled=false
 Bittorrent\LSDEnabled=false
 Queueing\QueueingEnabled=false
@@ -543,59 +599,21 @@ Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
 Bittorrent\MaxRatioAction=0
 Bittorrent\MaxRatio=-1
-Bittorrent\MaxSeedingTime=-1"
+Bittorrent\MaxSeedingTime=-1
+Session\AsyncIOThreadsCount=$threads_val
+EOF
 
-    # 动态生成性能配置 (注意：此处前导不能有空格，严格遵循 INI 格式)
-    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
-        cache_val="-1" # 5.x 禁用内存缓存，拥抱 mmap
-        threads_val="0"
         if [[ "$TUNE_MODE" == "1" ]]; then
-            # 核心修复项：5.x 版本的 I/O 与 Hashing 设置必须冠以 Advanced\ 前缀
-            config_extra="Advanced\DiskIOType=0
-Advanced\DiskIOReadMode=0
-Advanced\DiskIOWriteMode=0
-Advanced\HashingThreadsCount=0
+            cat >> "$config_file" << EOF
 Connection\MaxHalfOpenConnections=500
-Advanced\SendBufferWatermark=10240
-Advanced\SendBufferLowWatermark=3072
-Advanced\SendBufferTOSMark=2"
-        fi
-    else
-        # 4.x AIO 逻辑
-        if [[ "$is_ssd" == "true" ]]; then 
-            threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16")
-        else
-            threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
-        fi
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            config_extra="Connection\MaxHalfOpenConnections=500
-Advanced\SendBufferWatermark=10240
-Advanced\SendBufferLowWatermark=3072"
+Session\SendBufferWatermark=10240
+Session\SendBufferLowWatermark=3072
+EOF
         fi
     fi
 
-    # 写入 conf 保证严格换行 (注意去除了无效的 [BitTorrent] 分区头，全部归入 [Preferences] 层级下)
-    cat > "$HB/.config/qBittorrent/qBittorrent.conf" << EOF
-[Preferences]
-Downloads\SavePath=$HB/Downloads/
-Advanced\AsyncIOThreadsCount=$threads_val
-Connection\PortRangeMin=$QB_BT_PORT
-Downloads\DiskWriteCacheSize=$cache_val
-WebUI\Password_PBKDF2="$pass_hash"
-WebUI\Port=$QB_WEB_PORT
-WebUI\Username=$APP_USER
-WebUI\AuthSubnetWhitelist=127.0.0.1/32, 172.16.0.0/12, 10.0.0.0/8, 192.168.0.0/16, 172.17.0.0/16
-WebUI\AuthSubnetWhitelistEnabled=true
-WebUI\LocalHostAuthenticationEnabled=false
-WebUI\HostHeaderValidation=false
-WebUI\CSRFProtection=false
-WebUI\HTTPS\Enabled=false
-$config_pt_prefs
-$config_extra
-EOF
-    # 清理可能产生的空行
-    sed -i '/^$/d' "$HB/.config/qBittorrent/qBittorrent.conf"
-    chown "$APP_USER:$APP_USER" "$HB/.config/qBittorrent/qBittorrent.conf"
+    sed -i '/^$/d' "$config_file"
+    chown "$APP_USER:$APP_USER" "$config_file"
     
     cat > /etc/systemd/system/qbittorrent-nox@.service << EOF
 [Unit]
