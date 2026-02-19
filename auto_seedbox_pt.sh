@@ -641,16 +641,30 @@ install_apps() {
         mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
         mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
 
+        # 必须先声明变量，防止 set -u 报错退出
+        local need_init=true
         local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
         local set_file="$HB/vertex/data/setting.json"
 
-        # 判断是否为恢复模式生成了 setting.json
+        # 判断是否需要下载备份并解压
+        if [[ -n "$VX_RESTORE_URL" ]]; then
+            log_info "下载备份数据..."
+            download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
+            local unzip_cmd="unzip -o"
+            [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
+            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/\"" || true
+            need_init=false
+        elif [[ -f "$set_file" ]]; then
+            # 如果没有提供下载链接，但本地已经有 setting.json，说明是本地覆盖安装
+            need_init=false
+        fi
+
+        # 判断是否为恢复模式/已有配置
         if [[ -f "$set_file" ]]; then
-            log_info "检测到恢复包中的 setting.json，精准更新 WebUI 凭据，保留原有配置..."
-            # 使用 jq 只覆盖账号和密码，不动其他数据
+            log_info "检测到已有 setting.json，精准更新 WebUI 凭据，保留原有配置..."
             jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
                '.username = $u | .password = $p' "$set_file" > "${set_file}.tmp" && \
-               mv "${set_file}.tmp" "$set_file"
+               mv "${set_file}.tmp" "$set_file" || true
         else
             log_info "全新安装，生成初始 setting.json..."
             cat > "$set_file" << EOF
@@ -661,7 +675,7 @@ install_apps() {
 }
 EOF
         fi
-        
+
         # 处理下载器网关配置修正 (针对恢复备份的情况)
         if [[ "$need_init" == "false" ]]; then
             log_info "智能修正备份中的下载器配置..."
