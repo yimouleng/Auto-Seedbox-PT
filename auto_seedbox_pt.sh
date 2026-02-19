@@ -573,24 +573,33 @@ EOF
         # 登录并获取 Cookie
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        # 组装基础 JSON 载荷
-        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"max_connecs\":-1,\"max_connecs_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"queueing_enabled\":false"
+        # 组装基础 JSON 载荷 (修复了 max_conns 拼写错误，取消全局/单种连接数限制)
+        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"max_conns\":-1,\"max_conns_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"queueing_enabled\":false"
         
-        # 追加极限网络参数
+        # 注入 libtorrent 高级底层调优参数 (防爆内存与防吸血机制)
+        # bdecode_depth_limit/token_limit: 增强对巨大/畸形种子的解析能力
+        # upload_choking_algorithm: 1 (Anti-leech 优先反吸血)
+        # seed_choking_algorithm: 1 (Fastest upload 优先最快上传)
+        json_payload="${json_payload},\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"strict_super_seeding\":false"
+
+        # 追加极限网络参数 (针对万兆/G口)
         if [[ "$TUNE_MODE" == "1" ]]; then
-            json_payload="${json_payload},\"max_half_open_connections\":500,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2"
+            # 极高半开连接数，扩大发送缓冲区水线，开启 TOS 标记
+            json_payload="${json_payload},\"max_half_open_connections\":1000,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120"
         fi
         
         # 追加版本差异参数
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val"
+            # v5 (libtorrent v2): 依赖 mmap，无需传统 disk_cache，设置 disk_io_type=1 (内存映射)
+            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1"
         else
+            # v4 (libtorrent v1): 传统异步 IO 和缓存管理
             if [[ "$is_ssd" == "true" ]]; then 
                 threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16")
             else
                 threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
             fi
-            json_payload="${json_payload},\"disk_cache\":$cache_val,\"async_io_threads\":$threads_val"
+            json_payload="${json_payload},\"disk_cache\":$cache_val,\"async_io_threads\":$threads_val,\"disk_cache_ttl\":600"
         fi
         json_payload="${json_payload}}"
 
@@ -625,65 +634,38 @@ install_apps() {
     if [[ "$DO_VX" == "true" ]]; then
         print_banner "部署 Vertex (智能轮询)"
         
-        # 恢复原版：彻底清理空目录，防止阻断 Vertex 容器初始化
-        mkdir -p "$HB/vertex/data"
-        chmod 777 "$HB/vertex/data"
         docker rm -f vertex &>/dev/null || true
         
-        local need_init=true
-        if [[ -n "$VX_RESTORE_URL" ]]; then
-            log_info "下载备份数据..."
-            download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
-            local unzip_cmd="unzip -o"
-            [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
-            eval "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/\"" || true
-            need_init=false
-        elif [[ -f "$HB/vertex/data/setting.json" ]]; then
-             log_info "检测到已有配置，跳过初始化等待..."
-             need_init=false
-        fi
+        log_info "预先构建 Vertex 核心目录树，避开容器初始化竞态..."
+        mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
+        mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
+        mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
 
-        log_info "启动 Vertex 容器..."
-        docker run -d --name vertex \
-            --restart unless-stopped \
-            -p $VX_PORT:3000 \
-            -v "$HB/vertex":/vertex \
-            -e TZ=Asia/Shanghai \
-            lswl/vertex:stable >/dev/null 2>&1
+        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
+        local set_file="$HB/vertex/data/setting.json"
 
-        # 恢复原版：让容器先跑起来释放文件，我们只做监控等待
-        echo -n -e "${YELLOW}等待 Vertex 容器初始化目录结构 ${NC}"
-        sleep 5
-
-        if [[ "$need_init" == "true" ]]; then
-            local count=0
-            while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 30 ]; do
-                echo -n "."
-                sleep 1
-                count=$((count + 1))
-            done
-            echo ""
-            
-            if [[ ! -d "$HB/vertex/data/rule" ]]; then
-                log_warn "Vertex 目录初始化结束，正在触发智能干预，手动补全核心目录结构..."
-                mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
-                mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
-                mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
-            else
-                log_info "Vertex 初始目录结构已自动生成就绪。"
-            fi
-            
-            log_info "修正目录权限..."
-            chown -R "$APP_USER:$APP_USER" "$HB/vertex"
-            chmod -R 777 "$HB/vertex/data"
-            
-            # 停止容器以注入我们的设置
-            docker stop vertex >/dev/null 2>&1 || true
+        # 判断是否为恢复模式生成了 setting.json
+        if [[ -f "$set_file" ]]; then
+            log_info "检测到恢复包中的 setting.json，精准更新 WebUI 凭据，保留原有配置..."
+            # 使用 jq 只覆盖账号和密码，不动其他数据
+            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
+               '.username = $u | .password = $p' "$set_file" > "${set_file}.tmp" && \
+               mv "${set_file}.tmp" "$set_file"
         else
+            log_info "全新安装，生成初始 setting.json..."
+            cat > "$set_file" << EOF
+{
+  "username": "$APP_USER",
+  "password": "$vx_pass_md5",
+  "port": 3000
+}
+EOF
+        fi
+        
+        # 处理下载器网关配置修正 (针对恢复备份的情况)
+        if [[ "$need_init" == "false" ]]; then
             log_info "智能修正备份中的下载器配置..."
-            docker stop vertex >/dev/null 2>&1 || true
             local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
-            
             shopt -s nullglob
             local client_files=("$HB/vertex/data/client/"*.json)
             if [ ${#client_files[@]} -gt 0 ]; then
@@ -696,34 +678,22 @@ install_apps() {
                             "$client" > "${client}.tmp" && mv "${client}.tmp" "$client" || true
                     fi
                 done
-                log_info "连接信息已修正。"
             fi
             shopt -u nullglob
         fi
 
-        # 注入设置
-        local vx_pass_md5=$(echo -n "$APP_PASS" | md5sum | awk '{print $1}')
-        local set_file="$HB/vertex/data/setting.json"
-        
-        if [[ -f "$set_file" ]]; then
-            log_info "同步面板访问配置..."
-            jq --arg u "$APP_USER" --arg p "$vx_pass_md5" --argjson pt 3000 \
-                '.username = $u | .password = $p | .port = $pt' "$set_file" > "${set_file}.tmp" && \
-                mv "${set_file}.tmp" "$set_file"
-        else
-            cat > "$set_file" << EOF
-{
-  "username": "$APP_USER",
-  "password": "$vx_pass_md5",
-  "port": 3000
-}
-EOF
-        fi
-        
+        # 暴力赋予最高权限，杜绝 Docker 内 root 用户写入失败
+        chmod -R 777 "$HB/vertex/data"
         chown -R "$APP_USER:$APP_USER" "$HB/vertex"
 
-        log_info "重启 Vertex 服务..."
-        docker start vertex >/dev/null 2>&1 || true
+        log_info "启动 Vertex 容器..."
+        docker run -d --name vertex \
+            --restart unless-stopped \
+            -p $VX_PORT:3000 \
+            -v "$HB/vertex":/vertex \
+            -e TZ=Asia/Shanghai \
+            lswl/vertex:stable >/dev/null 2>&1
+
         open_port "$VX_PORT"
     fi
 
