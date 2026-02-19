@@ -506,7 +506,8 @@ install_qbit() {
             log_info "正在拉取指定版本: $tag"
         fi
         
-        local fname="${arch}-qbittorrent-nox-lt20"; [[ "$arch" == "x86_64" ]] && fname="x86_64-qbittorrent-nox-lt20"
+        # userdocs 在 5.x 的 release 文件名中不再带有 -lt20 后缀
+        local fname="${arch}-qbittorrent-nox"
         url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
     fi
     
