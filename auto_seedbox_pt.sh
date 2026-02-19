@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# Auto-Seedbox-PT (ASP) v1.5 (Extreme Tuning & Version Lock Edition)
+# Auto-Seedbox-PT (ASP) v1.6 (Extreme Tuning & Version Lock Edition)
 # qBittorrent  + libtorrent  + Vertex + FileBrowser 一键安装脚本
 # 系统要求: Debian 10+ / Ubuntu 20.04+ (x86_64 / aarch64)
 # 参数说明:
@@ -528,32 +528,33 @@ install_qbit() {
     local config_extra=""
 
     # 提取出独立的 PT 必备参数 (强制屏蔽吸血和隐私泄露，无论 4.x 还是 5.x 均适用)
-    local config_pt_prefs="BitTorrent\DHTEnabled=false
-BitTorrent\PeXEnabled=false
-BitTorrent\LSDEnabled=false
+    # 核心修复项：全部使用 -1 代表无限制，严格遵循 Bittorrent 大小写
+local config_pt_prefs="Bittorrent\DHTEnabled=false
+Bittorrent\PeXEnabled=false
+Bittorrent\LSDEnabled=false
 Queueing\QueueingEnabled=false
-Connection\GlobalDLLimit=0
-Connection\GlobalUPLimit=0
-Connection\MaxConnections=0
-Connection\MaxConnectionsPerTorrent=0
-Connection\MaxUploads=0
-Connection\MaxUploadsPerTorrent=0
+Connection\GlobalDLLimit=-1
+Connection\GlobalUPLimit=-1
+Connection\MaxConnections=-1
+Connection\MaxConnectionsPerTorrent=-1
+Connection\MaxUploads=-1
+Connection\MaxUploadsPerTorrent=-1
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
-BitTorrent\MaxRatioAction=0
-BitTorrent\MaxRatio=-1
-BitTorrent\MaxSeedingTime=-1"
+Bittorrent\MaxRatioAction=0
+Bittorrent\MaxRatio=-1
+Bittorrent\MaxSeedingTime=-1"
 
     # 动态生成性能配置 (注意：此处前导不能有空格，严格遵循 INI 格式)
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
         cache_val="-1" # 5.x 禁用内存缓存，拥抱 mmap
         threads_val="0"
         if [[ "$TUNE_MODE" == "1" ]]; then
-            config_extra="Session\DiskIOType=0
-Session\DiskIOReadMode=0
-Session\DiskIOWriteMode=0
-Session\HashingThreadsCount=0
-BitTorrent\MaxConcurrentDownloads=2000
+            # 核心修复项：5.x 版本的 I/O 与 Hashing 设置必须冠以 Advanced\ 前缀
+            config_extra="Advanced\DiskIOType=0
+Advanced\DiskIOReadMode=0
+Advanced\DiskIOWriteMode=0
+Advanced\HashingThreadsCount=0
 Connection\MaxHalfOpenConnections=500
 Advanced\SendBufferWatermark=10240
 Advanced\SendBufferLowWatermark=3072
@@ -567,19 +568,17 @@ Advanced\SendBufferTOSMark=2"
             threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
         fi
         if [[ "$TUNE_MODE" == "1" ]]; then
-            config_extra="BitTorrent\MaxConcurrentDownloads=2000
-Connection\MaxHalfOpenConnections=500
+            config_extra="Connection\MaxHalfOpenConnections=500
 Advanced\SendBufferWatermark=10240
 Advanced\SendBufferLowWatermark=3072"
         fi
     fi
 
-    # 写入 conf 保证严格换行 (将调优参数合规移交至 [Preferences] 层级下)
+    # 写入 conf 保证严格换行 (注意去除了无效的 [BitTorrent] 分区头，全部归入 [Preferences] 层级下)
     cat > "$HB/.config/qBittorrent/qBittorrent.conf" << EOF
-[BitTorrent]
-Session\DefaultSavePath=$HB/Downloads/
 [Preferences]
-Session\AsyncIOThreadsCount=$threads_val
+Downloads\SavePath=$HB/Downloads/
+Advanced\AsyncIOThreadsCount=$threads_val
 Connection\PortRangeMin=$QB_BT_PORT
 Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
