@@ -467,6 +467,8 @@ EOF
 
 # ================= 5. 应用部署逻辑 =================
 
+# ================= 5. 应用部署逻辑 =================
+
 install_qbit() {
     print_banner "部署 qBittorrent"
     local arch=$(uname -m); local url=""
@@ -519,13 +521,11 @@ install_qbit() {
 
     # ======== 完全隔离 4.x 和 5.x 的配置生成逻辑 ========
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
-        cache_val="-1" # 5.x 禁用内存缓存，拥抱 mmap
-        threads_val="0"
-        
+        # 5.x 禁用内存缓存配置，拥抱 mmap。移除了所有失效的 Advanced 磁盘与异步 IO 参数。
+        # 修正了严重的 [BitTorrent] 节点防泄漏参数层级错误，统一放入 [Preferences] 节点下
         cat > "$config_file" << EOF
 [Preferences]
 Downloads\SavePath=$HB/Downloads/
-Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -545,26 +545,6 @@ Connection\MaxUploadsPerTorrent=-1
 Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
-Advanced\AsyncIOThreadsCount=$threads_val
-EOF
-
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            cat >> "$config_file" << EOF
-Advanced\DiskIOType=0
-Advanced\DiskIOReadMode=0
-Advanced\DiskIOWriteMode=0
-Advanced\HashingThreadsCount=0
-Connection\MaxHalfOpenConnections=500
-Advanced\SendBufferWatermark=10240
-Advanced\SendBufferLowWatermark=3072
-Advanced\SendBufferTOSMark=2
-EOF
-        fi
-
-        # 添加 [BitTorrent] 节，放置协议开关
-        cat >> "$config_file" << EOF
-
-[BitTorrent]
 Bittorrent\DHTEnabled=false
 Bittorrent\PeXEnabled=false
 Bittorrent\LSDEnabled=false
@@ -572,6 +552,15 @@ Bittorrent\MaxRatioAction=0
 Bittorrent\MaxRatio=-1
 Bittorrent\MaxSeedingTime=-1
 EOF
+
+        if [[ "$TUNE_MODE" == "1" ]]; then
+            cat >> "$config_file" << EOF
+Connection\MaxHalfOpenConnections=500
+Advanced\SendBufferWatermark=10240
+Advanced\SendBufferLowWatermark=3072
+Advanced\SendBufferTOSMark=2
+EOF
+        fi
 
     else
         # 4.x AIO 逻辑
@@ -605,6 +594,12 @@ Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
 Session\AsyncIOThreadsCount=$threads_val
+Bittorrent\DHTEnabled=false
+Bittorrent\PeXEnabled=false
+Bittorrent\LSDEnabled=false
+Bittorrent\MaxRatioAction=0
+Bittorrent\MaxRatio=-1
+Bittorrent\MaxSeedingTime=-1
 EOF
 
         if [[ "$TUNE_MODE" == "1" ]]; then
@@ -614,18 +609,6 @@ Session\SendBufferWatermark=10240
 Session\SendBufferLowWatermark=3072
 EOF
         fi
-
-        # 添加 [BitTorrent] 节
-        cat >> "$config_file" << EOF
-
-[BitTorrent]
-Bittorrent\DHTEnabled=false
-Bittorrent\PeXEnabled=false
-Bittorrent\LSDEnabled=false
-Bittorrent\MaxRatioAction=0
-Bittorrent\MaxRatio=-1
-Bittorrent\MaxSeedingTime=-1
-EOF
     fi
 
     sed -i '/^$/d' "$config_file"
@@ -693,32 +676,33 @@ install_apps() {
             -e TZ=Asia/Shanghai \
             lswl/vertex:stable
 
-        log_info "等待 5 秒以让容器生成初始配置目录..."
-        sleep 5
-
         if [[ "$need_init" == "true" ]]; then
-            log_info "等待容器初始化目录结构..."
+            log_info "等待 Vertex 容器初始化目录结构及释放默认规则 (可能需要 10-30 秒)..."
             local count=0
-            while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 30 ]; do
+            # 放宽等待时间到 60 秒，留给 I/O 较慢的机器充分的初始化时间
+            while [ ! -d "$HB/vertex/data/rule" ] && [ $count -lt 60 ]; do
                 echo -n "."
-                sleep 1
-                count=$((count + 1))
+                sleep 2
+                count=$((count + 2))
             done
             echo ""
             
-            # 优化：仅在关键目录缺失时补全
+            # 智能检测是否生成，如果没有生成则自动预创建（兜底干预）
             if [[ ! -d "$HB/vertex/data/rule" ]]; then
-                log_info "补全核心目录结构..."
+                log_warn "Vertex 目录初始化似乎超时，正在触发智能干预，手动补全核心目录结构..."
                 mkdir -p "$HB/vertex/data/"{client,douban,irc,push,race,rss,rule,script,server,site,watch}
                 mkdir -p "$HB/vertex/data/douban/set" "$HB/vertex/data/watch/set"
                 mkdir -p "$HB/vertex/data/rule/"{delete,link,rss,race,raceSet}
+            else
+                log_info "Vertex 初始目录结构已自动生成就绪。"
             fi
             
             log_info "修正目录权限..."
             chown -R "$APP_USER:$APP_USER" "$HB/vertex"
             chmod -R 777 "$HB/vertex/data"
             
-            docker stop vertex >/dev/null 2>&1 || true
+            # 确保权限变更后容器能正常接管，执行一次重启
+            docker restart vertex >/dev/null 2>&1
         else
             log_info "智能修正备份中的下载器配置..."
             docker stop vertex >/dev/null 2>&1 || true
@@ -761,8 +745,8 @@ EOF
         
         chown -R "$APP_USER:$APP_USER" "$HB/vertex"
 
-        log_info "重启 Vertex 服务..."
-        docker start vertex
+        log_info "拉起 Vertex 服务..."
+        docker start vertex >/dev/null 2>&1 || true
         open_port "$VX_PORT"
     fi
 
