@@ -468,10 +468,11 @@ EOF
 # ================= 5. 应用部署逻辑 =================
 
 install_qbit() {
-    print_banner "部署 qBittorrent"
+print_banner "部署 qBittorrent (节结构优化版)"
     local arch=$(uname -m); local url=""
     local api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
     
+    # 1. 版本判定与下载
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
         INSTALLED_MAJOR_VER="4"
         log_info "锁定版本: 4.x (绑定 libtorrent v1.2.x)"
@@ -479,47 +480,43 @@ install_qbit() {
     else
         INSTALLED_MAJOR_VER="5"
         log_info "锁定大版本: 5.x (绑定 libtorrent v2.0.x 支持 mmap)"
-        
-        local tag=""
-        if [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "latest" ]]; then
-            tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
-            log_info "正在拉取最新版本: $tag"
-        else
+        local tag=$(curl -sL "$api" | jq -r '.[0].tag_name')
+        [[ "$QB_VER_REQ" != "5" && "$QB_VER_REQ" != "latest" ]] && \
             tag=$(curl -sL "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' | head -n 1)
-            if [[ -z "$tag" || "$tag" == "null" ]]; then
-                log_err "在 GitHub 仓库中未找到指定的 qBittorrent 版本: $QB_VER_REQ"
-            fi
-            log_info "正在拉取指定版本: $tag"
-        fi
-        
-        local fname="${arch}-qbittorrent-nox"
-        url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
+        url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${arch}-qbittorrent-nox"
     fi
     
     download_file "$url" "/usr/bin/qbittorrent-nox"
     chmod +x /usr/bin/qbittorrent-nox
     
+    # ⚠️ 关键步骤：在写入配置前彻底停止进程，防止旧配置在退出时覆盖新配置
+    log_info "正在清理旧进程以锁定配置文件..."
+    systemctl stop "qbittorrent-nox@$APP_USER" 2>/dev/null || true
+    pkill -9 -u "$APP_USER" qbittorrent-nox 2>/dev/null || true
+    sleep 2
+
     mkdir -p "$HB/.config/qBittorrent" "$HB/Downloads"
-    chown -R "$APP_USER:$APP_USER" "$HB/.config/qBittorrent" "$HB/Downloads"
-    
-    local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
-    
-    local root_disk=$(df $HB | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
-    local is_ssd=false
-    if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then is_ssd=true; fi
-
-    local threads_val="4"; local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
+    local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
 
-    # ======== 核心修复：完全隔离 4.x 和 5.x 的配置生成逻辑 ========
-    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then 
-        cache_val="-1" # 5.x 禁用内存缓存，拥抱 mmap
-        threads_val="0"
-        
+    # 2. 动态生成配置 (严格区分 Section)
+    log_info "正在应用 $INSTALLED_MAJOR_VER.x 版本的优化配置结构..."
+
+    if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
+        # 5.x 极致调优参数 (全部放入 Preferences)
+        local tune_params=""
+        if [[ "$TUNE_MODE" == "1" ]]; then
+            tune_params="Advanced\DiskIOType=0
+Advanced\DiskIOReadMode=0
+Advanced\DiskIOWriteMode=0
+Advanced\HashingThreadsCount=0
+Advanced\SendBufferWatermark=10240
+Advanced\SendBufferLowWatermark=3072
+Advanced\SendBufferTOSMark=2"
+        fi
+
         cat > "$config_file" << EOF
 [Preferences]
-Downloads\SavePath=$HB/Downloads/
-Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -529,52 +526,42 @@ WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
 WebUI\HTTPS\Enabled=false
+Downloads\SavePath=$HB/Downloads/
+Downloads\DiskWriteCacheSize=-1
+Connection\PortRangeMin=$QB_BT_PORT
+Connection\GlobalDLLimit=-1
+Connection\GlobalUPLimit=-1
+Connection\MaxConnections=-1
+Connection\MaxConnectionsPerTorrent=-1
+Connection\MaxUploads=-1
+Connection\MaxUploadsPerTorrent=-1
+Connection\MaxHalfOpenConnections=500
+Queueing\QueueingEnabled=false
+Advanced\AnnounceToAllTrackers=true
+Advanced\AnnounceToAllTiers=true
+Advanced\AsyncIOThreadsCount=0
+$tune_params
 
 [BitTorrent]
 Bittorrent\DHTEnabled=false
 Bittorrent\PeXEnabled=false
 Bittorrent\LSDEnabled=false
-Queueing\QueueingEnabled=false
-Connection\GlobalDLLimit=-1
-Connection\GlobalUPLimit=-1
-Connection\MaxConnections=-1
-Connection\MaxConnectionsPerTorrent=-1
-Connection\MaxUploads=-1
-Connection\MaxUploadsPerTorrent=-1
 Bittorrent\MaxRatioAction=0
 Bittorrent\MaxRatio=-1
 Bittorrent\MaxSeedingTime=-1
-Connection\PortRangeMin=$QB_BT_PORT
-Advanced\AnnounceToAllTrackers=true
-Advanced\AnnounceToAllTiers=true
-Advanced\AsyncIOThreadsCount=$threads_val
 EOF
-
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            cat >> "$config_file" << EOF
-Advanced\DiskIOType=0
-Advanced\DiskIOReadMode=0
-Advanced\DiskIOWriteMode=0
-Advanced\HashingThreadsCount=0
-Connection\MaxHalfOpenConnections=500
-Advanced\SendBufferWatermark=10240
-Advanced\SendBufferLowWatermark=3072
-Advanced\SendBufferTOSMark=2
-EOF
-        fi
 
     else
-        # 4.x AIO 逻辑
-        if [[ "$is_ssd" == "true" ]]; then 
-            threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16")
-        else
-            threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
+        # 4.x 调优参数 (4.x 使用 Session\ 前缀)
+        local tune_params_v4=""
+        if [[ "$TUNE_MODE" == "1" ]]; then
+            tune_params_v4="Connection\MaxHalfOpenConnections=500
+Session\SendBufferWatermark=10240
+Session\SendBufferLowWatermark=3072"
         fi
-        
+
         cat > "$config_file" << EOF
 [Preferences]
-Downloads\SavePath=$HB/Downloads/
-Downloads\DiskWriteCacheSize=$cache_val
 WebUI\Password_PBKDF2="$pass_hash"
 WebUI\Port=$QB_WEB_PORT
 WebUI\Username=$APP_USER
@@ -583,38 +570,37 @@ WebUI\AuthSubnetWhitelistEnabled=true
 WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
-WebUI\HTTPS\Enabled=false
+Downloads\SavePath=$HB/Downloads/
+Downloads\DiskWriteCacheSize=$QB_CACHE
 Connection\PortRangeMin=$QB_BT_PORT
-Bittorrent\DHTEnabled=false
-Bittorrent\PeXEnabled=false
-Bittorrent\LSDEnabled=false
-Queueing\QueueingEnabled=false
 Connection\GlobalDLLimit=-1
 Connection\GlobalUPLimit=-1
 Connection\MaxConnections=-1
 Connection\MaxConnectionsPerTorrent=-1
 Connection\MaxUploads=-1
 Connection\MaxUploadsPerTorrent=-1
+Queueing\QueueingEnabled=false
 Advanced\AnnounceToAllTrackers=true
 Advanced\AnnounceToAllTiers=true
+Session\AsyncIOThreadsCount=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "12")
+$tune_params_v4
+
+[BitTorrent]
+Bittorrent\DHTEnabled=false
+Bittorrent\PeXEnabled=false
+Bittorrent\LSDEnabled=false
 Bittorrent\MaxRatioAction=0
 Bittorrent\MaxRatio=-1
 Bittorrent\MaxSeedingTime=-1
-Session\AsyncIOThreadsCount=$threads_val
 EOF
-
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            cat >> "$config_file" << EOF
-Connection\MaxHalfOpenConnections=500
-Session\SendBufferWatermark=10240
-Session\SendBufferLowWatermark=3072
-EOF
-        fi
     fi
 
+    # 3. 权限与启动
     sed -i '/^$/d' "$config_file"
     chown "$APP_USER:$APP_USER" "$config_file"
+    chmod 600 "$config_file"
     
+    # 确保服务文件存在
     cat > /etc/systemd/system/qbittorrent-nox@.service << EOF
 [Unit]
 Description=qBittorrent Service (User: %i)
@@ -629,9 +615,14 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
-    systemctl restart "qbittorrent-nox@$APP_USER"
-    open_port "$QB_WEB_PORT"; open_port "$QB_BT_PORT" "tcp"; open_port "$QB_BT_PORT" "udp"
+
+    systemctl daemon-reload
+    systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
+    systemctl start "qbittorrent-nox@$APP_USER"
+    
+    open_port "$QB_WEB_PORT"
+    open_port "$QB_BT_PORT" "tcp"
+    open_port "$QB_BT_PORT" "udp"
 }
 
 install_apps() {
