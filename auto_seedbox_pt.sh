@@ -51,6 +51,7 @@ INSTALLED_MAJOR_VER="5"
 ACTION="install" 
 
 HB="/root"
+ASP_ENV_FILE="/etc/asp_env.sh"
 
 TEMP_DIR=$(mktemp -d -t asp-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -212,6 +213,11 @@ setup_user() {
 # ================= 3. 深度卸载逻辑 =================
 
 uninstall() {
+    # 读取安装时保留的环境变量，确保清理的是自定义端口
+    if [ -f "$ASP_ENV_FILE" ]; then
+        source "$ASP_ENV_FILE"
+    fi
+
     echo -e "${CYAN}=================================================${NC}"
     echo -e "${CYAN}        执行深度卸载流程 (含系统回滚)            ${NC}"
     echo -e "${CYAN}=================================================${NC}"
@@ -346,7 +352,7 @@ uninstall() {
              echo -e "${YELLOW}=================================================${NC}"
          fi
     fi
-    rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser"
+    rm -rf "/root/.config/qBittorrent" "/root/vertex" "/root/.config/filebrowser" "$ASP_ENV_FILE"
     log_warn "建议重启服务器 (reboot) 以彻底清理内核内存驻留。"
     
     log_info "卸载完成。"
@@ -380,7 +386,6 @@ optimize_system() {
         rmem_max=1073741824 
         tcp_wmem="4096 65536 1073741824"
         tcp_rmem="4096 87380 1073741824"
-        # 修复：防止 mmap 下极限囤积造成 OOM，强制积极刷盘 (绝对字节数策略)
         dirty_bytes=268435456
         dirty_bg_bytes=67108864
         backlog=250000
@@ -406,7 +411,6 @@ optimize_system() {
         dirty_bg_ratio=5
     fi
 
-    # 1. 写入极限 sysctl 配置
     cat > /etc/sysctl.d/99-ptbox.conf << EOF
 fs.file-max = 1048576
 fs.nr_open = 1048576
@@ -445,7 +449,6 @@ net.ipv4.tcp_adv_win_scale = -2
 net.ipv4.tcp_notsent_lowat = 131072
 EOF
 
-    # 2. 解除文件描述符封印
     if ! grep -q "Auto-Seedbox-PT" /etc/security/limits.conf; then
         cat >> /etc/security/limits.conf << EOF
 # Auto-Seedbox-PT Limits
@@ -456,7 +459,6 @@ root soft nofile 1048576
 EOF
     fi
 
-    # 3. 构造网卡与 CPU 调度器动态脚本
     cat > /usr/local/bin/asp-tune.sh << EOF_SCRIPT
 #!/bin/bash
 IS_VIRT=\$(systemd-detect-virt 2>/dev/null || echo "none")
@@ -507,11 +509,9 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
 
-    # 核心应用环节 (带 UI 动画)
     execute_with_spinner "注入百万级并发与高吞吐网络参数" sysctl --system
     execute_with_spinner "重载网卡队列与 CPU 性能调度器" systemctl start asp-tune.service || true
     
-    # 构建装逼矩阵面板
     local rmem_mb=$((rmem_max / 1024 / 1024))
     echo ""
     echo -e "  ${PURPLE}[⚡ ASP-Tuned 核心调优矩阵已挂载]${NC}"
@@ -559,7 +559,6 @@ install_qbit() {
             tag=$(curl -sL --max-time 10 "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' 2>/dev/null | head -n 1 || echo "null")
         fi
         
-        # API 防灾兜底机制
         if [[ -z "$tag" || "$tag" == "null" ]]; then
             log_warn "GitHub API 获取失败或受限，触发本地仓库兜底机制！"
             log_info "已自动降级为您个人的稳定内置版本: 5.0.4"
@@ -581,11 +580,7 @@ install_qbit() {
     rm -f "$HB/.local/share/qBittorrent/BT_backup/.lock"
     
     local pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
-    local root_disk=$(df $HB | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
-    local is_ssd=false
-    if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then is_ssd=true; fi
     
-    # 动态缓存大小计算
     if [[ "${CACHE_SET_BY_USER:-false}" == "false" ]]; then
         local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
         if [[ "$TUNE_MODE" == "1" ]]; then
@@ -598,7 +593,6 @@ install_qbit() {
     local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
-    # 初始化基础配置
     cat > "$config_file" << EOF
 [LegalNotice]
 Accepted=true
@@ -650,7 +644,7 @@ EOF
     systemctl start "qbittorrent-nox@$APP_USER"
     open_port "$QB_WEB_PORT"; open_port "$QB_BT_PORT" "tcp"; open_port "$QB_BT_PORT" "udp"
 
-    # 2. 轮询等待 WebUI 就绪
+    # 轮询等待 WebUI 就绪
     local api_ready=false
     printf "\e[?25l"
     for i in {1..20}; do
@@ -663,34 +657,47 @@ EOF
     done
     printf "\e[?25h"
 
-    # 3. WebAPI 参数注入
+    # 【重要重构】: API 参数动态融合注入，100% 兼容各类老版本
     if [[ "$api_ready" == "true" ]]; then
         printf "\r\033[K ${GREEN}[√]${NC} API 引擎握手成功！开始下发高级底层配置... \n"
         
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        # 【新增】：在这里加入了 "file_pool_size": 5000 和 "peer_tos": 184
-        local json_payload="{\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"file_pool_size\":5000,\"peer_tos\":184"
+        # 获取系统当前的默认配置
+        curl -s -b "$TEMP_DIR/qb_cookie.txt" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/preferences" > "$TEMP_DIR/current_pref.json"
+        
+        local patch_json="{\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"file_pool_size\":5000,\"peer_tos\":184"
         
         if [[ "$TUNE_MODE" == "1" ]]; then
-            json_payload="${json_payload},\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_half_open_connections\":500,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":32,\"max_active_downloads\":-1,\"max_active_uploads\":-1,\"max_active_torrents\":-1"
+            patch_json="${patch_json},\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_half_open_connections\":500,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":32,\"max_active_downloads\":-1,\"max_active_uploads\":-1,\"max_active_torrents\":-1"
         else
-            json_payload="${json_payload},\"max_connec\":2000,\"max_connec_per_torrent\":100,\"max_uploads\":500,\"max_uploads_per_torrent\":20,\"max_half_open_connections\":50,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2,\"connection_speed\":500,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":8"
+            patch_json="${patch_json},\"max_connec\":2000,\"max_connec_per_torrent\":100,\"max_uploads\":500,\"max_uploads_per_torrent\":20,\"max_half_open_connections\":50,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2,\"connection_speed\":500,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":8"
         fi
         
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
             local hash_threads=$(nproc 2>/dev/null || echo 2)
-            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0,\"hashing_threads\":$hash_threads"
+            patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0,\"hashing_threads\":$hash_threads"
         else
             if [[ "$TUNE_MODE" == "1" ]]; then
-                json_payload="${json_payload},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
+                patch_json="${patch_json},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
             else
-                json_payload="${json_payload},\"disk_cache\":$cache_val,\"disk_cache_ttl\":1200"
+                patch_json="${patch_json},\"disk_cache\":$cache_val,\"disk_cache_ttl\":1200"
             fi
         fi
-        json_payload="${json_payload}}"
+        patch_json="${patch_json}}"
+        echo "$patch_json" > "$TEMP_DIR/patch_pref.json"
 
-        local http_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$TEMP_DIR/qb_cookie.txt" -X POST --data-urlencode "json=$json_payload" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/setPreferences")
+        local final_payload="$patch_json"
+        
+        # 使用 jq 动态合并现有配置与补丁
+        if command -v jq >/dev/null && grep -q "{" "$TEMP_DIR/current_pref.json"; then
+            jq -s '.[0] * .[1]' "$TEMP_DIR/current_pref.json" "$TEMP_DIR/patch_pref.json" > "$TEMP_DIR/final_pref.json" 2>/dev/null || true
+            if [[ -s "$TEMP_DIR/final_pref.json" && $(cat "$TEMP_DIR/final_pref.json") != "null" ]]; then
+                final_payload=$(cat "$TEMP_DIR/final_pref.json")
+            fi
+        fi
+
+        local http_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$TEMP_DIR/qb_cookie.txt" -X POST --data-urlencode "json=$final_payload" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/setPreferences")
         
         if [[ "$http_code" == "200" ]]; then
             echo -e " ${GREEN}[√]${NC} 引擎防泄漏与底层网络已完全锁定为极速状态！"
@@ -698,7 +705,7 @@ EOF
         else
             echo -e " ${RED}[X]${NC} API 注入失败 (Code: $http_code)，请手动配置。"
         fi
-        rm -f "$TEMP_DIR/qb_cookie.txt"
+        rm -f "$TEMP_DIR/qb_cookie.txt" "$TEMP_DIR/"*pref.json
     else
         echo -e "\n ${RED}[X]${NC} qBittorrent WebUI 未能在 20 秒内响应！"
     fi
@@ -726,34 +733,30 @@ install_apps() {
         local need_init=true
 
         if [[ -n "$VX_RESTORE_URL" ]]; then
+            # 【修复】使用独立临时沙盒防备 Tarbomb 绝对路径攻击
+            local extract_tmp=$(mktemp -d)
             local is_tar=false
             if [[ "$VX_RESTORE_URL" == *.tar.gz* || "$VX_RESTORE_URL" == *.tgz* ]]; then
                 is_tar=true
                 download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.tar.gz"
-                execute_with_spinner "解压原生 tar.gz 备份数据" tar -xzf "$TEMP_DIR/bk.tar.gz" -C "$HB/vertex/data/"
+                execute_with_spinner "解压原生 tar.gz 备份数据" tar -xzf "$TEMP_DIR/bk.tar.gz" -C "$extract_tmp"
             else
                 download_file "$VX_RESTORE_URL" "$TEMP_DIR/bk.zip"
-                local unzip_cmd="unzip -o"
-                [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -o -P\"$VX_ZIP_PASS\""
-                execute_with_spinner "解压 ZIP 备份数据" sh -c "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/data/\""
+                local unzip_cmd="unzip -q -o"
+                [[ -n "$VX_ZIP_PASS" ]] && unzip_cmd="unzip -q -o -P\"$VX_ZIP_PASS\""
+                execute_with_spinner "解压 ZIP 备份数据" sh -c "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$extract_tmp\""
             fi
             
-            local real_set=$(find "$HB/vertex/data" -name "setting.json" | head -n 1)
+            local real_set=$(find "$extract_tmp" -name "setting.json" | head -n 1)
             if [[ -n "$real_set" ]]; then
                 local real_dir=$(dirname "$real_set")
-                if [[ "$real_dir" != "$HB/vertex/data" ]]; then
-                    log_info "侦测到嵌套的备份结构，正在将数据展平挂载..."
-                    local tmp_vx_bk=$(mktemp -d)
-                    shopt -s dotglob
-                    mv "$real_dir"/* "$tmp_vx_bk/" 2>/dev/null || true
-                    rm -rf "$HB/vertex/data"/*
-                    mv "$tmp_vx_bk"/* "$HB/vertex/data/" 2>/dev/null || true
-                    shopt -u dotglob
-                    rm -rf "$tmp_vx_bk"
-                fi
+                shopt -s dotglob
+                mv "$real_dir"/* "$HB/vertex/data/" 2>/dev/null || true
+                shopt -u dotglob
             else
                 log_warn "备份包解压后未找到 setting.json，这可能是一个损坏的备份文件！"
             fi
+            rm -rf "$extract_tmp"
             need_init=false
         elif [[ -f "$set_file" ]]; then
             log_info "检测到本地已有配置，执行原地接管..."
@@ -765,18 +768,19 @@ install_apps() {
         if [[ "$need_init" == "false" ]]; then
             log_info "智能桥接备份数据与新网络架构 (启动 Python 强制清洗层)..."
             
-            cat > "$TEMP_DIR/vx_fix.py" << EOF
-import json, os, codecs
+            # 【重构】使用 EOF_PYTHON 将 Python 代码独立包装，并加入严格容错
+            cat << 'EOF_PYTHON' > "$TEMP_DIR/vx_fix.py"
+import json, os, codecs, sys
 
-vx_dir = "$HB/vertex/data"
-app_user = "$APP_USER"
-md5_pass = "$vx_pass_md5"
-gw_ip = "$gw"
-qb_port = "$QB_WEB_PORT"
-app_pass = "$APP_PASS"
+vx_dir = sys.argv[1]
+app_user = sys.argv[2]
+md5_pass = sys.argv[3]
+gw_ip = sys.argv[4]
+qb_port = sys.argv[5]
+app_pass = sys.argv[6]
 
 def update_json(path, modifier_func):
-    if not os.path.exists(path): return
+    if not os.path.exists(path) or not path.endswith('.json'): return
     try:
         with codecs.open(path, "r", "utf-8-sig") as f:
             data = json.load(f)
@@ -784,7 +788,7 @@ def update_json(path, modifier_func):
             with codecs.open(path, "w", "utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        pass
+        pass # 静默忽略非法字符或非标准JSON
 
 def fix_setting(d):
     d["username"] = app_user
@@ -796,18 +800,17 @@ update_json(os.path.join(vx_dir, "setting.json"), fix_setting)
 client_dir = os.path.join(vx_dir, "client")
 if os.path.exists(client_dir):
     for fname in os.listdir(client_dir):
-        if fname.endswith(".json"):
-            def fix_client(d):
-                c_type = d.get("client", "") or d.get("type", "")
-                if "qBittorrent" in c_type or "qbittorrent" in c_type.lower():
-                    d["clientUrl"] = f"http://{gw_ip}:{qb_port}"
-                    d["username"] = app_user
-                    d["password"] = app_pass
-                    return True
-                return False
-            update_json(os.path.join(client_dir, fname), fix_client)
-EOF
-            python3 "$TEMP_DIR/vx_fix.py"
+        def fix_client(d):
+            c_type = d.get("client", "") or d.get("type", "")
+            if "qBittorrent" in c_type or "qbittorrent" in c_type.lower():
+                d["clientUrl"] = f"http://{gw_ip}:{qb_port}"
+                d["username"] = app_user
+                d["password"] = app_pass
+                return True
+            return False
+        update_json(os.path.join(client_dir, fname), fix_client)
+EOF_PYTHON
+            python3 "$TEMP_DIR/vx_fix.py" "$HB/vertex/data" "$APP_USER" "$vx_pass_md5" "$gw" "$QB_WEB_PORT" "$APP_PASS"
         else
             cat > "$set_file" << EOF
 {
@@ -878,7 +881,7 @@ echo -e "${CYAN}       / _ | / __/ |/ _ \\ ${NC}"
 echo -e "${CYAN}      / __ |_\\ \\  / ___/ ${NC}"
 echo -e "${CYAN}     /_/ |_/___/ /_/     ${NC}"
 echo -e "${BLUE}========================================================${NC}"
-echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v1.8.0 ✦${NC}"
+echo -e "${PURPLE}   ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v2.0 ✦${NC}"
 echo -e "${PURPLE}   ✦ 作者：Supcutie Github：yimouleng/Auto-Seedbox-PT ✦${NC}"
 echo -e "${BLUE}========================================================${NC}"
 echo ""
@@ -968,7 +971,9 @@ if [[ -z "$APP_PASS" ]]; then
     echo ""
 fi
 
+# 【修复依赖锁死】在安装依赖前强行纠正 dpkg 中断状态
 export DEBIAN_FRONTEND=noninteractive
+execute_with_spinner "修复可能的系统包损坏状态" sh -c "dpkg --configure -a && apt-get --fix-broken install -y >/dev/null 2>&1 || true"
 execute_with_spinner "部署核心运行依赖 (curl, jq, tar...)" sh -c "apt-get -qq update && apt-get -qq install -y curl wget jq unzip tar python3 net-tools ethtool iptables"
 
 if [[ "$CUSTOM_PORT" == "true" ]]; then
@@ -978,6 +983,14 @@ if [[ "$CUSTOM_PORT" == "true" ]]; then
     [[ "$DO_VX" == "true" ]] && VX_PORT=$(get_input_port "Vertex" 3000)
     [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
 fi
+
+# 【持久化】记录自定义端口以供后续安全卸载
+cat > "$ASP_ENV_FILE" << EOF
+QB_WEB_PORT=$QB_WEB_PORT
+QB_BT_PORT=$QB_BT_PORT
+VX_PORT=${VX_PORT:-3000}
+FB_PORT=${FB_PORT:-8081}
+EOF
 
 setup_user
 install_qbit
