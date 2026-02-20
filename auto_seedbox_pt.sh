@@ -598,7 +598,7 @@ install_qbit() {
     local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
-    # 【终极修复1】: C++枚举值矫正: Type 2 是 POSIX
+    # 初始化基础配置
     cat > "$config_file" << EOF
 [LegalNotice]
 Accepted=true
@@ -669,7 +669,8 @@ EOF
         
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        local json_payload="{\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1"
+        # 【新增】：在这里加入了 "file_pool_size": 5000 和 "peer_tos": 184
+        local json_payload="{\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"file_pool_size\":5000,\"peer_tos\":184"
         
         if [[ "$TUNE_MODE" == "1" ]]; then
             json_payload="${json_payload},\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_half_open_connections\":500,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":32,\"max_active_downloads\":-1,\"max_active_uploads\":-1,\"max_active_torrents\":-1"
@@ -677,7 +678,6 @@ EOF
             json_payload="${json_payload},\"max_connec\":2000,\"max_connec_per_torrent\":100,\"max_uploads\":500,\"max_uploads_per_torrent\":20,\"max_half_open_connections\":50,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2,\"connection_speed\":500,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":8"
         fi
         
-        # WebAPI 载荷同样修正枚举为 2 (POSIX)
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
             local hash_threads=$(nproc 2>/dev/null || echo 2)
             json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0,\"hashing_threads\":$hash_threads"
@@ -738,7 +738,6 @@ install_apps() {
                 execute_with_spinner "解压 ZIP 备份数据" sh -c "$unzip_cmd \"$TEMP_DIR/bk.zip\" -d \"$HB/vertex/data/\""
             fi
             
-            # 【终极修复2】: 强行展平任何外壳嵌套，避免 Docker 挂载空壳导致生成新实例
             local real_set=$(find "$HB/vertex/data" -name "setting.json" | head -n 1)
             if [[ -n "$real_set" ]]; then
                 local real_dir=$(dirname "$real_set")
