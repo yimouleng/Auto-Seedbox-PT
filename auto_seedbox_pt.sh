@@ -56,7 +56,7 @@ ASP_ENV_FILE="/etc/asp_env.sh"
 TEMP_DIR=$(mktemp -d -t asp-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# 固化直链库 (兜底与默认版本)
+# 个人专属固化直链库 (兜底与默认版本)
 URL_V4_AMD64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/x86_64/qBittorrent-4.3.9-libtorrent-v1.2.20/qbittorrent-nox"
 URL_V4_ARM64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/ARM64/qBittorrent-4.3.9-libtorrent-v1.2.20/qbittorrent-nox"
 URL_V5_AMD64="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/qBittorrent/x86_64/qBittorrent-5.0.4-libtorrent-v2.0.11/qbittorrent-nox"
@@ -593,7 +593,7 @@ install_qbit() {
     local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
-    # 【新增中文配置】强制底层设定初始语言为中文 (zh)
+    # 【强制中文配置】初始化即锁定 zh
     cat > "$config_file" << EOF
 [LegalNotice]
 Accepted=true
@@ -667,7 +667,7 @@ EOF
         # 获取系统当前的默认配置
         curl -s -b "$TEMP_DIR/qb_cookie.txt" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/preferences" > "$TEMP_DIR/current_pref.json"
         
-        # 【新增 API 中文锁】加入 "locale":"zh"
+        # 【二次强制锁区】注入 payload 包含 locale: zh 
         local patch_json="{\"locale\":\"zh\",\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"file_pool_size\":5000,\"peer_tos\":184"
         
         if [[ "$TUNE_MODE" == "1" ]]; then
@@ -759,7 +759,6 @@ install_apps() {
             local real_set=$(find "$extract_tmp" -name "setting.json" | head -n 1)
             if [[ -n "$real_set" ]]; then
                 local real_dir=$(dirname "$real_set")
-                # 【重大修复】改用 cp -a 完美合并目录树，避免 mv 在目标同名目录存在时无法覆盖的问题
                 cp -a "$real_dir"/. "$HB/vertex/data/" 2>/dev/null || true
             else
                 log_warn "备份包解压后未找到 setting.json，这可能是一个损坏的备份文件！"
@@ -800,7 +799,7 @@ def update_json(path, modifier_func):
             with codecs.open(path, "w", "utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        log_err(f"Failed to process {path}: {str(e)}") # 异常静默流转至日志，不中断主流程
+        log_err(f"Failed to process {path}: {str(e)}")
 
 def fix_setting(d):
     d["username"] = app_user
@@ -834,7 +833,6 @@ EOF
         fi
 
         chown -R "$APP_USER:$APP_USER" "$HB/vertex"
-        # Docker 容器可能需要特殊 UID 的写入权限，兼顾容错保留 777
         chmod -R 777 "$HB/vertex/data"
 
         execute_with_spinner "拉取 Vertex 镜像 (文件较大，视网络情况约需 1~3 分钟)" docker pull lswl/vertex:stable
@@ -896,8 +894,8 @@ echo -e "${CYAN}     /_/ |_/___/ /_/     ${NC}"
 echo -e "${BLUE}================================================================${NC}"
 echo -e "${PURPLE}           ✦ Auto-Seedbox-PT (ASP) 极速部署引擎 v2.0 ✦${NC}"
 echo -e "${PURPLE}           ✦              作者：Supcutie             ✦${NC}"
-echo -e "${GREEN}    🚀 一键部署 qBittorrent + Vertex + FileBrowser 刷流引擎${NC}"
-echo -e "${YELLOW}    💡 GitHub：https://github.com/yimouleng/Auto-Seedbox-PT ${NC}"
+echo -e "${GREEN}             🚀 一键构建极致优化的 PT 刷流套件${NC}"
+echo -e "${YELLOW}           💡 GitHub: yimouleng/Auto-Seedbox-PT ${NC}"
 echo -e "${BLUE}================================================================${NC}"
 echo ""
 
@@ -998,7 +996,6 @@ if [[ "$CUSTOM_PORT" == "true" ]]; then
     [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
 fi
 
-# 【增强安全】以 600 权限写入环境变量文件，杜绝非 root 越权读取
 cat > "$ASP_ENV_FILE" << EOF
 QB_WEB_PORT=$QB_WEB_PORT
 QB_BT_PORT=$QB_BT_PORT
@@ -1014,6 +1011,14 @@ install_qbit
 
 PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "ServerIP")
 
+# 提取字符串变量，彻底消除极个别老版本 Bash 中嵌套引号引发的意外截断
+tune_str=""
+if [[ "$TUNE_MODE" == "1" ]]; then
+    tune_str="${RED}Mode 1 (极限刷流)${NC}"
+else
+    tune_str="${GREEN}Mode 2 (均衡保种)${NC}"
+fi
+
 # ================= 极简极客版终端 Dashboard =================
 echo ""
 echo ""
@@ -1025,11 +1030,11 @@ cat << EOF
 ========================================================================
   [系统状态] 
 EOF
-echo -e "  ▶ 调优模式 : $([[ "$TUNE_MODE" == "1" ]] && echo "${RED}Mode 1 (极限刷流)${NC}" || echo "${GREEN}Mode 2 (均衡保种)${NC}")"
+echo -e "  ▶ 调优模式 : $tune_str"
 echo -e "  ▶ 运行用户 : ${YELLOW}$APP_USER${NC} (已做运行目录隔离，保障安全)"
 echo ""
 echo -e " ------------------------ ${CYAN}🌐 终端访问地址${NC} ------------------------"
-echo -e "  🧩 qBittorrent WebUI : ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
+echo -e "  🧩 qBittorrent WebUI : ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC} (若不是中文，请按Ctrl+F5清空缓存)"
 if [[ "$DO_VX" == "true" ]]; then
 echo -e "  🌐 Vertex 智控面板   : ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
 echo -e "     └─ 内部直连 qBit  : ${YELLOW}$VX_GW:$QB_WEB_PORT${NC}"
@@ -1062,4 +1067,3 @@ echo -e " ⚠️ ${YELLOW}强烈建议: 极速内核参数已注入，请执行 
 echo -e "========================================================================"
 fi
 echo ""
-```
