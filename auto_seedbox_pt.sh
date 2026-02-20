@@ -537,6 +537,8 @@ install_qbit() {
     print_banner "部署 qBittorrent 引擎"
     local arch=$(uname -m); local url=""
     local api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
+    # 提取全局 Hash 线程计算变量，避免重复执行 nproc
+    local hash_threads=$(nproc 2>/dev/null || echo 2)
     
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
         INSTALLED_MAJOR_VER="4"
@@ -612,7 +614,6 @@ Connection\PortRangeMin=$QB_BT_PORT
 EOF
 
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-        local hash_threads=$(nproc 2>/dev/null || echo 2)
         cat >> "$config_file" << EOF
 Session\DiskIOType=2
 Session\DiskIOReadMode=0
@@ -657,7 +658,6 @@ EOF
     done
     printf "\e[?25h"
 
-    # 【重要重构】: API 参数动态融合注入，100% 兼容各类老版本
     if [[ "$api_ready" == "true" ]]; then
         printf "\r\033[K ${GREEN}[√]${NC} API 引擎握手成功！开始下发高级底层配置... \n"
         
@@ -675,7 +675,6 @@ EOF
         fi
         
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            local hash_threads=$(nproc 2>/dev/null || echo 2)
             patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0,\"hashing_threads\":$hash_threads"
         else
             if [[ "$TUNE_MODE" == "1" ]]; then
@@ -689,12 +688,19 @@ EOF
 
         local final_payload="$patch_json"
         
-        # 使用 jq 动态合并现有配置与补丁
+        # 【增强回退日志】动态合并现有配置与补丁
         if command -v jq >/dev/null && grep -q "{" "$TEMP_DIR/current_pref.json"; then
-            jq -s '.[0] * .[1]' "$TEMP_DIR/current_pref.json" "$TEMP_DIR/patch_pref.json" > "$TEMP_DIR/final_pref.json" 2>/dev/null || true
-            if [[ -s "$TEMP_DIR/final_pref.json" && $(cat "$TEMP_DIR/final_pref.json") != "null" ]]; then
-                final_payload=$(cat "$TEMP_DIR/final_pref.json")
+            if jq -s '.[0] * .[1]' "$TEMP_DIR/current_pref.json" "$TEMP_DIR/patch_pref.json" > "$TEMP_DIR/final_pref.json" 2>/dev/null; then
+                if [[ -s "$TEMP_DIR/final_pref.json" && $(cat "$TEMP_DIR/final_pref.json") != "null" ]]; then
+                    final_payload=$(cat "$TEMP_DIR/final_pref.json")
+                else
+                    log_warn "API 载荷合并后数据为空，已触发防呆回退机制 (直接下发补丁)。"
+                fi
+            else
+                log_warn "jq 解析失败或版本跨度过大，已触发防呆回退机制 (直接下发补丁)。"
             fi
+        else
+            log_warn "未检测到 jq 依赖或拉取初始配置失败，已触发防呆回退机制 (直接下发补丁)。"
         fi
 
         local http_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$TEMP_DIR/qb_cookie.txt" -X POST --data-urlencode "json=$final_payload" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/setPreferences")
@@ -733,7 +739,6 @@ install_apps() {
         local need_init=true
 
         if [[ -n "$VX_RESTORE_URL" ]]; then
-            # 【修复】使用独立临时沙盒防备 Tarbomb 绝对路径攻击
             local extract_tmp=$(mktemp -d)
             local is_tar=false
             if [[ "$VX_RESTORE_URL" == *.tar.gz* || "$VX_RESTORE_URL" == *.tgz* ]]; then
@@ -750,9 +755,8 @@ install_apps() {
             local real_set=$(find "$extract_tmp" -name "setting.json" | head -n 1)
             if [[ -n "$real_set" ]]; then
                 local real_dir=$(dirname "$real_set")
-                shopt -s dotglob
-                mv "$real_dir"/* "$HB/vertex/data/" 2>/dev/null || true
-                shopt -u dotglob
+                # 【重大修复】改用 cp -a 完美合并解压后的目录树，防止旧逻辑 mv 遇到同名目录无法覆盖导致删种规则丢失
+                cp -a "$real_dir"/. "$HB/vertex/data/" 2>/dev/null || true
             else
                 log_warn "备份包解压后未找到 setting.json，这可能是一个损坏的备份文件！"
             fi
@@ -768,7 +772,6 @@ install_apps() {
         if [[ "$need_init" == "false" ]]; then
             log_info "智能桥接备份数据与新网络架构 (启动 Python 强制清洗层)..."
             
-            # 【重构】使用 EOF_PYTHON 将 Python 代码独立包装，并加入严格容错
             cat << 'EOF_PYTHON' > "$TEMP_DIR/vx_fix.py"
 import json, os, codecs, sys
 
@@ -788,7 +791,7 @@ def update_json(path, modifier_func):
             with codecs.open(path, "w", "utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        pass # 静默忽略非法字符或非标准JSON
+        pass # 静默忽略损坏的或非 UTF-8 编码的文件
 
 def fix_setting(d):
     d["username"] = app_user
@@ -971,7 +974,6 @@ if [[ -z "$APP_PASS" ]]; then
     echo ""
 fi
 
-# 【修复依赖锁死】在安装依赖前强行纠正 dpkg 中断状态
 export DEBIAN_FRONTEND=noninteractive
 execute_with_spinner "修复可能的系统包损坏状态" sh -c "dpkg --configure -a && apt-get --fix-broken install -y >/dev/null 2>&1 || true"
 execute_with_spinner "部署核心运行依赖 (curl, jq, tar...)" sh -c "apt-get -qq update && apt-get -qq install -y curl wget jq unzip tar python3 net-tools ethtool iptables"
@@ -984,13 +986,14 @@ if [[ "$CUSTOM_PORT" == "true" ]]; then
     [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
 fi
 
-# 【持久化】记录自定义端口以供后续安全卸载
+# 【增强安全】以 600 权限写入环境变量文件，杜绝非 root 越权读取
 cat > "$ASP_ENV_FILE" << EOF
 QB_WEB_PORT=$QB_WEB_PORT
 QB_BT_PORT=$QB_BT_PORT
 VX_PORT=${VX_PORT:-3000}
 FB_PORT=${FB_PORT:-8081}
 EOF
+chmod 600 "$ASP_ENV_FILE"
 
 setup_user
 install_qbit
