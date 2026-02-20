@@ -43,6 +43,7 @@ DO_VX=false
 DO_FB=false
 DO_TUNE=false
 CUSTOM_PORT=false
+CACHE_SET_BY_USER=false
 TUNE_MODE="1"
 VX_RESTORE_URL=""
 VX_ZIP_PASS=""
@@ -371,6 +372,8 @@ optimize_system() {
     
     local dirty_ratio=20
     local dirty_bg_ratio=5
+    local dirty_bytes=""
+    local dirty_bg_bytes=""
     local backlog=65535
     local syn_backlog=65535
     
@@ -384,9 +387,9 @@ optimize_system() {
         rmem_max=1073741824 
         tcp_wmem="4096 65536 1073741824"
         tcp_rmem="4096 87380 1073741824"
-        # 修复：防止 mmap 下极限囤积造成 OOM，强制积极刷盘
-        dirty_ratio=20
-        dirty_bg_ratio=5
+        # 修复：防止 mmap 下极限囤积造成 OOM，强制积极刷盘 (绝对字节数策略)
+        dirty_bytes=268435456
+        dirty_bg_bytes=67108864
         backlog=250000
         syn_backlog=819200
         
@@ -415,8 +418,21 @@ optimize_system() {
 fs.file-max = 1048576
 fs.nr_open = 1048576
 vm.swappiness = 1
+EOF
+
+    if [[ "$TUNE_MODE" == "1" ]]; then
+        cat >> /etc/sysctl.d/99-ptbox.conf << EOF
+vm.dirty_bytes = $dirty_bytes
+vm.dirty_background_bytes = $dirty_bg_bytes
+EOF
+    else
+        cat >> /etc/sysctl.d/99-ptbox.conf << EOF
 vm.dirty_ratio = $dirty_ratio
 vm.dirty_background_ratio = $dirty_bg_ratio
+EOF
+    fi
+
+    cat >> /etc/sysctl.d/99-ptbox.conf << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = $target_cc
 net.core.somaxconn = 65535
@@ -431,6 +447,9 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_adv_win_scale = -2
+net.ipv4.tcp_notsent_lowat = 131072
 EOF
 
     # 2. 解除文件描述符封印
@@ -506,10 +525,11 @@ EOF
     echo -e "  ${CYAN}├─${NC} 拥塞控制算法 : ${GREEN}${ui_cc}${NC} (智能穿透匹配)"
     echo -e "  ${CYAN}├─${NC} 全局并发上限 : ${YELLOW}1,048,576${NC} (解除 Socket 封印)"
     echo -e "  ${CYAN}├─${NC} TCP 缓冲上限 : ${YELLOW}${rmem_mb} MB${NC} (极限吞吐保障)"
-    echo -e "  ${CYAN}├─${NC} 脏页回写策略 : ${YELLOW}ratio=${dirty_ratio}, bg_ratio=${dirty_bg_ratio}${NC} (防 I/O 阻塞)"
     if [[ "$TUNE_MODE" == "1" ]]; then
+        echo -e "  ${CYAN}├─${NC} 脏页回写策略 : ${YELLOW}bytes=${dirty_bytes}, bg_bytes=${dirty_bg_bytes}${NC} (防 I/O 阻塞)"
         echo -e "  ${CYAN}├─${NC} CPU 调度策略 : ${RED}performance${NC} (锁定最高主频)"
     else
+        echo -e "  ${CYAN}├─${NC} 脏页回写策略 : ${YELLOW}ratio=${dirty_ratio}, bg_ratio=${dirty_bg_ratio}${NC} (防 I/O 阻塞)"
         echo -e "  ${CYAN}├─${NC} CPU 调度策略 : ${GREEN}ondemand/schedutil${NC} (动态节能)"
     fi
     echo -e "  ${CYAN}└─${NC} 磁盘与网卡流 : ${YELLOW}I/O Multi-Queue & TX-Queue 扩容${NC}"
@@ -571,6 +591,17 @@ install_qbit() {
     local root_disk=$(df $HB | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
     local is_ssd=false
     if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then is_ssd=true; fi
+    
+    # 动态缓存大小计算（如果用户没有指定 -c）
+    if [[ "${CACHE_SET_BY_USER:-false}" == "false" ]]; then
+        local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+        if [[ "$TUNE_MODE" == "1" ]]; then
+            QB_CACHE=$((total_mem_mb * 35 / 100))
+        else
+            QB_CACHE=$((total_mem_mb * 15 / 100))
+            [[ $QB_CACHE -gt 2048 ]] && QB_CACHE=2048
+        fi
+    fi
     local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
@@ -635,25 +666,30 @@ EOF
         # 登录并获取 Cookie
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        # 组装基础 PT 必选规范载荷 (关DHT/PEX/LSD，开启向所有Tracker汇报)
-        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1"
+        # 组装基础 PT 必选规范载荷 (强制纯TCP, 关DHT/PEX/LSD，开启向所有Tracker汇报)
+        local json_payload="{\"bittorrent_protocol\":0,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1"
         
         # 根据调优模式区分连接与 I/O 策略
         if [[ "$TUNE_MODE" == "1" ]]; then
-            # Mode 1: 极限刷流 (全开并发)
-            json_payload="${json_payload},\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_half_open_connections\":2000,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":32"
+            # Mode 1: 极限刷流 (全开并发，降低半开连接防封，强制活跃任务数)
+            json_payload="${json_payload},\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_half_open_connections\":500,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":32,\"max_active_downloads\":-1,\"max_active_uploads\":-1,\"max_active_torrents\":-1"
         else
-            # Mode 2: 均衡保种 (限制并发，保护 HDD)
-            json_payload="${json_payload},\"max_connec\":2000,\"max_connec_per_torrent\":100,\"max_uploads\":500,\"max_uploads_per_torrent\":20,\"max_half_open_connections\":100,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2,\"connection_speed\":500,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":8"
+            # Mode 2: 均衡保种 (限制并发，降低半开连接，保护 HDD)
+            json_payload="${json_payload},\"max_connec\":2000,\"max_connec_per_torrent\":100,\"max_uploads\":500,\"max_uploads_per_torrent\":20,\"max_half_open_connections\":50,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2,\"connection_speed\":500,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":8"
         fi
         
         # 根据版本区分内存缓存机制
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            # v5 专属：设置工作集限制，并强行切换为 POSIX IO 绕开 mmap 内存泄漏
-            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0"
+            # v5 专属：设置工作集限制，并强行切换为 POSIX IO 绕开 mmap，开启 Direct IO
+            local hash_threads=$(nproc 2>/dev/null || echo 2)
+            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1,\"disk_io_read_mode\":1,\"disk_io_write_mode\":1,\"hashing_threads\":$hash_threads"
         else
-            # v4 专属：传统的磁盘缓存控制
-            json_payload="${json_payload},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
+            # v4 专属：传统的磁盘缓存控制 (Mode 2 延长过期时间)
+            if [[ "$TUNE_MODE" == "1" ]]; then
+                json_payload="${json_payload},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
+            else
+                json_payload="${json_payload},\"disk_cache\":$cache_val,\"disk_cache_ttl\":1200"
+            fi
         fi
         json_payload="${json_payload}}"
 
@@ -778,7 +814,7 @@ while [[ $# -gt 0 ]]; do
         --purge) ACTION="purge"; shift ;;
         -u|--user) APP_USER="$2"; shift 2 ;;
         -p|--pass) APP_PASS="$2"; shift 2 ;;
-        -c|--cache) QB_CACHE="$2"; shift 2 ;;
+        -c|--cache) QB_CACHE="$2"; CACHE_SET_BY_USER=true; shift 2 ;;
         -q|--qbit) QB_VER_REQ="$2"; shift 2 ;;
         -m|--mode) TUNE_MODE="$2"; shift 2 ;;
         -v|--vertex) DO_VX=true; shift ;;
