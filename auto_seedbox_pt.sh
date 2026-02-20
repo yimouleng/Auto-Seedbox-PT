@@ -666,8 +666,8 @@ EOF
         # 登录并获取 Cookie
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        # 组装基础 PT 必选规范载荷 (强制纯TCP, 关DHT/PEX/LSD，开启向所有Tracker汇报)
-        local json_payload="{\"bittorrent_protocol\":0,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1"
+        # 组装基础 PT 必选规范载荷 (【修复】强制纯TCP对应值为1, 关DHT/PEX/LSD，开启向所有Tracker汇报)
+        local json_payload="{\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1"
         
         # 根据调优模式区分连接与 I/O 策略
         if [[ "$TUNE_MODE" == "1" ]]; then
@@ -680,9 +680,9 @@ EOF
         
         # 根据版本区分内存缓存机制
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            # v5 专属：设置工作集限制，并强行切换为 POSIX IO 绕开 mmap，开启 Direct IO
+            # v5 专属：设置工作集限制，并强行切换为 POSIX IO 绕开 mmap，开启 Direct IO (【修复】0代表Disable OS Cache)
             local hash_threads=$(nproc 2>/dev/null || echo 2)
-            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1,\"disk_io_read_mode\":1,\"disk_io_write_mode\":1,\"hashing_threads\":$hash_threads"
+            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0,\"hashing_threads\":$hash_threads"
         else
             # v4 专属：传统的磁盘缓存控制 (Mode 2 延长过期时间)
             if [[ "$TUNE_MODE" == "1" ]]; then
@@ -698,6 +698,8 @@ EOF
         
         if [[ "$http_code" == "200" ]]; then
             echo -e " ${GREEN}[√]${NC} 引擎防泄漏与底层网络已完全锁定为极速状态！"
+            # 【修复】强制重启以应用 "需要重启" 的设置 (如磁盘IO类型)
+            systemctl restart "qbittorrent-nox@$APP_USER"
         else
             echo -e " ${RED}[X]${NC} API 注入失败 (Code: $http_code)，请手动配置。"
         fi
@@ -752,9 +754,14 @@ install_apps() {
         if [[ "$need_init" == "false" ]]; then
             log_info "智能桥接备份数据与新网络架构..."
             if [[ -f "$set_file" ]]; then
-                jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
-                   '.username = $u | .password = $p' "$set_file" > "${set_file}.tmp" && \
-                   mv "${set_file}.tmp" "$set_file" || true
+                # 【修复】去除可能存在的 BOM 头，防止 jq 解析失败导致密码没被覆盖
+                sed -i 's/^\xEF\xBB\xBF//' "$set_file" 2>/dev/null || true
+                if jq --arg u "$APP_USER" --arg p "$vx_pass_md5" \
+                   '.username = $u | .password = $p' "$set_file" > "${set_file}.tmp"; then
+                   mv "${set_file}.tmp" "$set_file"
+                else
+                   log_warn "Vertex setting.json 解析失败！登录账号密码将保持与您的原备份一致。"
+                fi
             fi
 
             local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
