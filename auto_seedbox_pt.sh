@@ -369,7 +369,7 @@ optimize_system() {
     local rmem_max=$((mem_kb * 1024 / 2))
     local tcp_mem_min=$((mem_kb / 16)); local tcp_mem_def=$((mem_kb / 8)); local tcp_mem_max=$((mem_kb / 4))
     
-    local dirty_ratio=60
+    local dirty_ratio=20
     local dirty_bg_ratio=5
     local backlog=65535
     local syn_backlog=65535
@@ -384,8 +384,9 @@ optimize_system() {
         rmem_max=1073741824 
         tcp_wmem="4096 65536 1073741824"
         tcp_rmem="4096 87380 1073741824"
-        dirty_ratio=60
-        dirty_bg_ratio=10
+        # 修复：防止 mmap 下极限囤积造成 OOM，强制积极刷盘
+        dirty_ratio=20
+        dirty_bg_ratio=5
         backlog=250000
         syn_backlog=819200
         
@@ -570,7 +571,7 @@ install_qbit() {
     local root_disk=$(df $HB | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//;s/\/dev\///')
     local is_ssd=false
     if [ -f "/sys/block/$root_disk/queue/rotational" ] && [ "$(cat /sys/block/$root_disk/queue/rotational)" == "0" ]; then is_ssd=true; fi
-    local threads_val="4"; local cache_val="$QB_CACHE"
+    local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
     # 1. 基础引导配置
@@ -605,6 +606,8 @@ Group=$APP_USER
 ExecStart=/usr/bin/qbittorrent-nox --webui-port=$QB_WEB_PORT
 Restart=on-failure
 LimitNOFILE=1048576
+MemoryHigh=80%
+MemoryMax=85%
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -632,27 +635,25 @@ EOF
         # 登录并获取 Cookie
         curl -s -c "$TEMP_DIR/qb_cookie.txt" --data "username=$APP_USER&password=$APP_PASS" "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
         
-        # 组装基础 JSON 载荷
-        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"queueing_enabled\":false"
+        # 组装基础 PT 必选规范载荷 (关DHT/PEX/LSD，开启向所有Tracker汇报)
+        local json_payload="{\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1"
         
-        # 注入 libtorrent 高级底层调优参数
-        json_payload="${json_payload},\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"strict_super_seeding\":false"
-        
-        # 追加极限网络参数
+        # 根据调优模式区分连接与 I/O 策略
         if [[ "$TUNE_MODE" == "1" ]]; then
-            json_payload="${json_payload},\"max_half_open_connections\":1000,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120"
+            # Mode 1: 极限刷流 (全开并发)
+            json_payload="${json_payload},\"max_connec\":-1,\"max_connec_per_torrent\":-1,\"max_uploads\":-1,\"max_uploads_per_torrent\":-1,\"max_half_open_connections\":2000,\"send_buffer_watermark\":51200,\"send_buffer_low_watermark\":10240,\"send_buffer_tos_mark\":2,\"connection_speed\":1000,\"peer_timeout\":120,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":32"
+        else
+            # Mode 2: 均衡保种 (限制并发，保护 HDD)
+            json_payload="${json_payload},\"max_connec\":2000,\"max_connec_per_torrent\":100,\"max_uploads\":500,\"max_uploads_per_torrent\":20,\"max_half_open_connections\":100,\"send_buffer_watermark\":10240,\"send_buffer_low_watermark\":3072,\"send_buffer_tos_mark\":2,\"connection_speed\":500,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":8"
         fi
         
-        # 追加版本差异参数
+        # 根据版本区分内存缓存机制
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val"
+            # v5 专属：设置工作集限制，并强行切换为 POSIX IO 绕开 mmap 内存泄漏
+            json_payload="${json_payload},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":1,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0"
         else
-            if [[ "$is_ssd" == "true" ]]; then 
-                threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "32" || echo "16")
-            else
-                threads_val=$([[ "$TUNE_MODE" == "1" ]] && echo "8" || echo "4")
-            fi
-            json_payload="${json_payload},\"disk_cache\":$cache_val,\"async_io_threads\":$threads_val,\"disk_cache_ttl\":600"
+            # v4 专属：传统的磁盘缓存控制
+            json_payload="${json_payload},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
         fi
         json_payload="${json_payload}}"
 
@@ -924,7 +925,7 @@ VX_GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>
 
 cat << EOF
 ========================================================================
-                      ✨ AUTO-SEEDBOX-PT 部署完成 ✨                      
+                    ✨ AUTO-SEEDBOX-PT 部署完成 ✨                     
 ========================================================================
   [系统状态] 
 EOF
