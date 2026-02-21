@@ -454,7 +454,6 @@ root soft nofile 1048576
 EOF
     fi
 
-    # 【修复内核日志脏写报错】加入队列调度器安全探测
     cat > /usr/local/bin/asp-tune.sh << EOF_SCRIPT
 #!/bin/bash
 IS_VIRT=\$(systemd-detect-virt 2>/dev/null || echo "none")
@@ -598,7 +597,6 @@ install_qbit() {
     local cache_val="$QB_CACHE"
     local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
-    # 【强制中文配置】初始化锁定 zh_CN，彻底解决语言回退 bug
     cat > "$config_file" << EOF
 [LegalNotice]
 Accepted=true
@@ -620,10 +618,14 @@ Connection\PortRangeMin=$QB_BT_PORT
 EOF
 
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
+        # 【双模动态 I/O 修复】模式 1 开启 Direct I/O (1)，模式 2 保持系统缓存 (0) 保护机械硬盘
+        local io_mode=0
+        [[ "$TUNE_MODE" == "1" ]] && io_mode=1
+        
         cat >> "$config_file" << EOF
 Session\DiskIOType=2
-Session\DiskIOReadMode=0
-Session\DiskIOWriteMode=0
+Session\DiskIOReadMode=$io_mode
+Session\DiskIOWriteMode=$io_mode
 Session\MemoryWorkingSetLimit=$cache_val
 Session\HashingThreads=$hash_threads
 EOF
@@ -670,7 +672,6 @@ EOF
         
         curl -s -b "$TEMP_DIR/qb_cookie.txt" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/preferences" > "$TEMP_DIR/current_pref.json"
         
-        # 【二次强制锁区】注入 payload 包含 locale: zh_CN
         local patch_json="{\"locale\":\"zh_CN\",\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"file_pool_size\":5000,\"peer_tos\":184"
         
         if [[ "$TUNE_MODE" == "1" ]]; then
@@ -680,7 +681,10 @@ EOF
         fi
         
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":0,\"disk_io_write_mode\":0,\"hashing_threads\":$hash_threads"
+            # 【双模动态 I/O API注入修复】
+            local io_mode=0
+            [[ "$TUNE_MODE" == "1" ]] && io_mode=1
+            patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":$io_mode,\"disk_io_write_mode\":$io_mode,\"hashing_threads\":$hash_threads"
         else
             if [[ "$TUNE_MODE" == "1" ]]; then
                 patch_json="${patch_json},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
@@ -772,7 +776,6 @@ install_apps() {
             need_init=false
         fi
 
-        # 【安全修复】获取 Docker Gateway 并防空
         local gw=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
         [[ -z "$gw" ]] && gw="172.17.0.1"
 
@@ -1000,7 +1003,6 @@ if [[ "$CUSTOM_PORT" == "true" ]]; then
     [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
 fi
 
-# 【强制带环境穿透】使用 export 写入环境变量，杜绝子 Shell 找不到配置
 cat > "$ASP_ENV_FILE" << EOF
 export QB_WEB_PORT=$QB_WEB_PORT
 export QB_BT_PORT=$QB_BT_PORT
@@ -1027,7 +1029,6 @@ fi
 echo ""
 echo ""
 
-# 【安全获取网关】
 VX_GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
 [[ -z "$VX_GW" ]] && VX_GW="172.17.0.1"
 
