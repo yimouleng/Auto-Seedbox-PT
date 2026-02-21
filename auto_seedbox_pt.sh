@@ -618,9 +618,9 @@ Connection\PortRangeMin=$QB_BT_PORT
 EOF
 
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-        # 【双模动态 I/O 修复】模式 1 开启 Direct I/O (1)，模式 2 保持系统缓存 (0) 保护机械硬盘
-        local io_mode=0
-        [[ "$TUNE_MODE" == "1" ]] && io_mode=1
+        # 【双模动态 I/O 修复】模式 1 禁用缓存 (0)，模式 2 启用缓存 (1) 保机械盘
+        local io_mode=1
+        [[ "$TUNE_MODE" == "1" ]] && io_mode=0
         
         cat >> "$config_file" << EOF
 Session\DiskIOType=2
@@ -682,8 +682,8 @@ EOF
         
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
             # 【双模动态 I/O API注入修复】
-            local io_mode=0
-            [[ "$TUNE_MODE" == "1" ]] && io_mode=1
+            local io_mode=1
+            [[ "$TUNE_MODE" == "1" ]] && io_mode=0
             patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":$io_mode,\"disk_io_write_mode\":$io_mode,\"hashing_threads\":$hash_threads"
         else
             if [[ "$TUNE_MODE" == "1" ]]; then
