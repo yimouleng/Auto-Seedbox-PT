@@ -1858,11 +1858,11 @@ if [[ -f "$AUTOTUNE_TMR" ]]; then
 fi
 echo ""
 echo -e " ------------------------ ${CYAN}🌐 访问地址${NC} ------------------------"
-echo -e "  🧩 qBittorrent WebUI : ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
-echo -e "  ${YELLOW}安全提示: WebUI 为兼容部分环境已关闭 Host/CSRF 校验且默认 HTTP 明文，可手动在qb中关闭。${NC}"
+echo -e "  ${YELLOW}⚠️ 安全提示: WebUI 为兼容部分环境已关闭 Host/CSRF 校验且默认 HTTP 明文，可手动在qb中关闭。${NC}"
 if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
     echo -e "  ${YELLOW}提示: 若首次看到种子为 0，可 Ctrl+F5 强制刷新${NC}"
 fi
+echo -e "  🧩 qBittorrent WebUI : ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
 if [[ "$DO_VX" == "true" ]]; then
 echo -e "  🌐 Vertex 面板      : ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
 echo -e "     └─ 内部直连 qBit : ${YELLOW}$VX_GW:$QB_WEB_PORT${NC}"
