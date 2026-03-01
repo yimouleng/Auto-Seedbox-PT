@@ -4,10 +4,10 @@
   const SS_API = "/api/ss";
   const SS_WIDTH = 1280;
   const SS_COUNT = 6;
-  const ICON_URL = "/mnt/data/screenshot_button_icon.png";  // Icon path for the screenshot button
+  const ICON_URL = "https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/screenshot/asp-screenshot_icon.png";  // CDN path for the screenshot button icon
 
   function getCurrentPath() {
-    // Ensure the current file path is retrieved via FileBrowser structure
+    // Ensure we get the current file path from FileBrowser
     const h = window.location.hash || "";
     const m = h.match(/^#\/files\/(.*)$/);
     if (!m) return null;
