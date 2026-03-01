@@ -1565,7 +1565,7 @@ find "$HB/vertex/data/script" -type f \( -name "*.sh" -o -name "*.py" \) -exec c
         execute_with_spinner "拉取 MediaInfo 前端扩展" sh -c "wget -qO /usr/local/bin/asp-mediainfo.js \"${JS_REMOTE_URL}?v=$(date +%s%N)\""
         execute_with_spinner "拉取 SweetAlert2" wget -qO /usr/local/bin/sweetalert2.all.min.js "https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"
 # Screenshot 前端扩展（从 GitHub 拉取，带 cache-buster 防止中间缓存）
-local SS_JS_URL="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/screenshot/asp-screenshot.js"
+local SS_JS_URL="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/asp-screenshot.js"
 execute_with_spinner "拉取 Screenshot 截图扩展" sh -c "wget -qO /usr/local/bin/asp-screenshot.js \"${SS_JS_URL}?v=$(date +%s%N)\""
 chmod +x /usr/local/bin/asp-screenshot.js
 
