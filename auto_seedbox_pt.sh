@@ -717,7 +717,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable asp-tune.service >/dev/null 2>&1
 
-    execute_with_spinner "注入高吞吐网络参数" sysctl --system
+    execute_with_spinner "注入高吞吐网络参数" sh -c "sysctl --system || true"
     execute_with_spinner "重载网卡队列与 CPU 调度" systemctl start asp-tune.service || true
 
     local rmem_mb=$((rmem_max / 1024 / 1024))
@@ -1599,7 +1599,7 @@ find "$HB/vertex/data/script" -type f \( -name "*.sh" -o -name "*.py" \) -exec c
             execute_with_spinner "安装 Nginx" sh -c "apt-get update -qq && apt-get install -y nginx"
         fi
 
-        local JS_REMOTE_URL="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/screenshot/asp-mediainfo.js"
+        local JS_REMOTE_URL="https://github.com/yimouleng/Auto-Seedbox-PT/raw/refs/heads/main/asp-mediainfo.js"
         execute_with_spinner "拉取 MediaInfo 前端扩展" sh -c "wget -qO /usr/local/bin/asp-mediainfo.js \"${JS_REMOTE_URL}?v=$(date +%s%N)\""
         execute_with_spinner "拉取 SweetAlert2" wget -qO /usr/local/bin/sweetalert2.all.min.js "https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"
 # Screenshot 前端扩展（从 GitHub 拉取，带 cache-buster 防止中间缓存）
