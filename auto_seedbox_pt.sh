@@ -566,28 +566,28 @@ EOF
     disk_class=$(detect_download_disk_class "$HB/Downloads")
 
     local rmem_max=16777216
-    local dirty_ratio=20
+    local dirty_ratio=15
     local dirty_bg_ratio=5
     local backlog=30000
     local syn_backlog=65535
 
     if [[ "$disk_class" == "hdd" ]]; then
-        dirty_ratio=15
-        dirty_bg_ratio=5
+        dirty_ratio=12
+        dirty_bg_ratio=4
     fi
 
     if [[ "$TUNE_MODE" == "1" ]]; then
         if [[ $mem_gb_sys -ge 30 ]]; then
             rmem_max=67108864
-            dirty_ratio=40
-            dirty_bg_ratio=10
+            dirty_ratio=20
+            dirty_bg_ratio=5
             backlog=100000
             syn_backlog=100000
             echo -e "  ${PURPLE}↳ 检测到纯血级算力 (>=32GB)，已解锁高位内核权限 (64MB Buffer)！${NC}"
         elif [[ $mem_gb_sys -ge 15 ]]; then
             rmem_max=33554432
-            dirty_ratio=30
-            dirty_bg_ratio=10
+            dirty_ratio=15
+            dirty_bg_ratio=5
             backlog=50000
             syn_backlog=100000
             echo -e "  ${PURPLE}↳ 检测到中大型算力 (>=16GB)，已挂载进阶内核权限 (32MB Buffer)。${NC}"
@@ -1287,7 +1287,7 @@ EOF
         if is_g95_preset && [[ "$disk_class" == "ssd" ]]; then
             sb_low=16384
             sb_buf=65536
-            sb_factor=250
+            sb_factor=300
         fi
 
         if [[ "$TUNE_MODE" == "1" ]]; then
