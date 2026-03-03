@@ -1043,7 +1043,7 @@ Description=ASP qBittorrent AutoTune Timer (M1)
 
 [Timer]
 OnBootSec=30
-OnUnitActiveSec=20
+OnUnitActiveSec=120
 AccuracySec=1
 Unit=asp-qb-autotune.service
 
@@ -1218,7 +1218,7 @@ Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
 
-OOMScoreAdjust=500
+OOMScoreAdjust=0
 MemoryAccounting=true
 MemoryHigh=${mem_high_mb}M
 MemoryMax=${mem_limit_mb}M
