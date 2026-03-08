@@ -7,7 +7,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_NAME="Auto-Seedbox-Apps"
 LOG_FILE="/tmp/asp_apps_install.log"
 APP_ENV_FILE="/etc/auto_seedbox_apps.env"
@@ -1008,14 +1008,25 @@ uninstall_apps() {
 show_plan() {
   section "安装计划"
   echo "执行模式:"
-  [[ "$DO_VX" == true ]] && echo "  - 安装 Vertex"
-  [[ "$DO_FB" == true ]] && echo "  - 安装 FileBrowser"
+  if [[ "$DO_VX" == true ]]; then
+    echo "  - 安装 Vertex"
+  fi
+  if [[ "$DO_FB" == true ]]; then
+    echo "  - 安装 FileBrowser"
+  fi
+
   echo
   echo "基础信息:"
   echo "  - 用户名          : ${APP_USER}"
   echo "  - 安装目录        : ${BASE_DIR}"
-  [[ "$DO_VX" == true ]] && echo "  - Vertex 端口     : ${VX_PORT}"
-  [[ "$DO_FB" == true ]] && echo "  - FileBrowser 端口: ${FB_PORT}"
+
+  if [[ "$DO_VX" == true ]]; then
+    echo "  - Vertex 端口     : ${VX_PORT}"
+  fi
+  if [[ "$DO_FB" == true ]]; then
+    echo "  - FileBrowser 端口: ${FB_PORT}"
+  fi
+
   if [[ "$DO_FB" == true ]]; then
     if [[ "$FB_MODE" == "custom-root" ]]; then
       echo "  - FB 模式         : 自定义根目录"
@@ -1025,7 +1036,12 @@ show_plan() {
       echo "  - FB 根目录       : ${HB}"
     fi
   fi
-  [[ -n "$VX_RESTORE_URL" ]] && echo "  - Vertex 备份     : ${VX_RESTORE_URL}"
+
+  if [[ -n "$VX_RESTORE_URL" ]]; then
+    echo "  - Vertex 备份     : ${VX_RESTORE_URL}"
+  fi
+
+  return 0
 }
 
 summary() {
