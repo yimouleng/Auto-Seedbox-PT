@@ -89,7 +89,6 @@
             if (data.media && data.media.track) {
                 data.media.track.forEach(t => {
                     let type = t['@type'] || 'Unknown';
-                    // 头部空行，更符合原生 CLI 观感
                     rawText += `${type}\n`;
                     html += `<div class="mi-track mi-${type}"><div class="mi-track-header">${type}</div>`;
 
@@ -98,7 +97,6 @@
                         let val = t[k];
                         if (typeof val === 'object') val = JSON.stringify(val);
                         
-                        // 优化对齐逻辑：原生格式通常是 Key 占一定宽度，然后跟 ' : '
                         let paddedKey = String(k).padEnd(32, ' ');
                         rawText += `${paddedKey}: ${val}\n`;
 
@@ -113,7 +111,6 @@
             }
             html += `</div>`;
             
-            // 优化：提供纯文本与 BBCode 两种复制选项
             Swal.fire({ 
                 title: fileName, 
                 html: html, 
@@ -121,16 +118,14 @@
                 showCancelButton: true,
                 showDenyButton: true,
                 confirmButtonColor: '#3085d6',
-                denyButtonColor: '#28a745', // 绿色
+                denyButtonColor: '#28a745',
                 cancelButtonColor: '#555',
                 confirmButtonText: '📋 纯文本',
                 denyButtonText: '🏷️ 复制 BBCode',
                 cancelButtonText: '关闭',
-                // 拦截“纯文本”按钮点击
                 preConfirm: () => {
                     let textToCopy = rawText.trim();
                     copyText(textToCopy).then(() => {
-                        // 修改按钮文字作为反馈，不触发新的 Swal 弹窗
                         let btn = Swal.getConfirmButton();
                         let originalText = btn.innerHTML;
                         btn.innerHTML = '✅ 纯文本复制成功！';
@@ -138,13 +133,11 @@
                     }).catch(() => {
                         alert('复制失败，请手动选中上方文本进行复制');
                     });
-                    return false; // 返回 false 阻止弹窗关闭
+                    return false;
                 },
-                // 拦截“复制 BBCode”按钮点击
                 preDeny: () => {
                     let textToCopy = `[quote]\n${rawText.trim()}\n[/quote]`;
                     copyText(textToCopy).then(() => {
-                        // 修改按钮文字作为反馈
                         let btn = Swal.getDenyButton();
                         let originalText = btn.innerHTML;
                         btn.innerHTML = '✅ BBCode 复制成功！';
@@ -152,13 +145,47 @@
                     }).catch(() => {
                         alert('复制失败，请手动选中上方文本进行复制');
                     });
-                    return false; // 返回 false 阻止弹窗关闭
+                    return false;
                 }
             });
         }).catch(e => Swal.fire('解析失败', e.toString(), 'error'));
     };
 
-    // 性能优化：加入防抖 (Debounce) 机制
+    function getAnchorButton(menu) {
+        if (!menu) return null;
+        return menu.querySelector([
+            'button[aria-label="Info"]',
+            'button[title="Info"]',
+            'button[aria-label="信息"]',
+            'button[title="信息"]',
+            'button[aria-label="详情"]',
+            'button[title="详情"]'
+        ].join(','));
+    }
+
+    function getActionMenus() {
+        const menus = new Set();
+
+        document.querySelectorAll('#dropdown, .context-menu').forEach((menu) => {
+            if (menu && menu.querySelector('button.action')) {
+                menus.add(menu);
+            }
+        });
+
+        document.querySelectorAll([
+            'button[aria-label="Info"]',
+            'button[title="Info"]',
+            'button[aria-label="信息"]',
+            'button[title="信息"]',
+            'button[aria-label="详情"]',
+            'button[title="详情"]'
+        ].join(',')).forEach((btn) => {
+            if (btn.parentElement) menus.add(btn.parentElement);
+        });
+
+        return menus;
+    }
+
     let observerTimer = null;
     const observer = new MutationObserver(() => {
         if (observerTimer) clearTimeout(observerTimer);
@@ -175,13 +202,9 @@
                 }
             }
 
-            // 扩展支持：添加原盘 index.bdmv 及无损音频格式
             let isMedia = targetFile && targetFile.match(/\.(mp4|mkv|avi|ts|iso|rmvb|wmv|flv|mov|webm|vob|m2ts|bdmv|flac|wav|ape|alac)$/i);
 
-            let menus = new Set();
-            document.querySelectorAll('button[aria-label="Info"]').forEach(btn => {
-                if (btn.parentElement) menus.add(btn.parentElement);
-            });
+            let menus = getActionMenus();
 
             menus.forEach(menu => {
                 let existingBtn = menu.querySelector('.asp-mi-btn-class');
@@ -200,9 +223,9 @@
                             openMediaInfo(targetFile);
                         };
                         
-                        let infoBtn = menu.querySelector('button[aria-label="Info"]');
-                        if (infoBtn) {
-                            infoBtn.insertAdjacentElement('afterend', btn);
+                        let anchorBtn = getAnchorButton(menu);
+                        if (anchorBtn) {
+                            anchorBtn.insertAdjacentElement('afterend', btn);
                         } else {
                             menu.appendChild(btn);
                         }
@@ -211,7 +234,7 @@
                     if (existingBtn) existingBtn.remove();
                 }
             });
-        }, 100); // 100ms 延迟，极大降低浏览器性能开销
+        }, 100);
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
