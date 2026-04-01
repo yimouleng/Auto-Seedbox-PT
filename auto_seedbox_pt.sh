@@ -1642,34 +1642,38 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
 
             try:
-                res = subprocess.run(['mediainfo', '--Output=JSON', full_path], capture_output=True, text=True)
+                res_text = subprocess.run(['mediainfo', full_path], capture_output=True, text=True)
+                raw_text = res_text.stdout
+
+                res_json = subprocess.run(['mediainfo', '--Output=JSON', full_path], capture_output=True, text=True)
+                media = None
                 try:
-                    json.loads(res.stdout)
-                    self.wfile.write(res.stdout.encode('utf-8'))
-                    return
-                except:
+                    media = json.loads(res_json.stdout)
+                except Exception:
                     pass
 
-                res_text = subprocess.run(['mediainfo', full_path], capture_output=True, text=True)
-                lines = res_text.stdout.split('\n')
-                tracks = []
-                current_track = {}
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        if current_track:
-                            tracks.append(current_track)
-                            current_track = {}
-                        continue
-                    if ':' not in line and '@type' not in current_track:
-                        current_track['@type'] = line
-                    elif ':' in line:
-                        k, v = line.split(':', 1)
-                        current_track[k.strip()] = v.strip()
-                if current_track:
-                    tracks.append(current_track)
+                if media is None:
+                    lines = raw_text.split('\n')
+                    tracks = []
+                    current_track = {}
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            if current_track:
+                                tracks.append(current_track)
+                                current_track = {}
+                            continue
+                        if ':' not in line and '@type' not in current_track:
+                            current_track['@type'] = line
+                        elif ':' in line:
+                            k, v = line.split(':', 1)
+                            current_track[k.strip()] = v.strip()
+                    if current_track:
+                        tracks.append(current_track)
+                    media = {"media": {"track": tracks}}
 
-                self.wfile.write(json.dumps({"media": {"track": tracks}}).encode('utf-8'))
+                payload = {"raw_text": raw_text, **media}
+                self.wfile.write(json.dumps(payload).encode('utf-8'))
 
             except Exception as e:
                 self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
@@ -2047,7 +2051,7 @@ echo -e "${CYAN}       / _ | / __/ |/ _ \\ ${NC}"
 echo -e "${CYAN}      / __ |_\\ \\  / ___/ ${NC}"
 echo -e "${CYAN}     /_/ |_/___/ /_/     ${NC}"
 echo -e "${BLUE}================================================================${NC}"
-echo -e "${PURPLE}     ✦ Auto-Seedbox-PT (ASP) 极限部署引擎 v3.5.5 ✦${NC}"
+echo -e "${PURPLE}     ✦ Auto-Seedbox-PT (ASP) 极限部署引擎 v3.5.6 ✦${NC}"
 echo -e "${PURPLE}     ✦               作者：Supcutie              ✦${NC}"
 echo -e "${GREEN}    🚀 一键部署 qBittorrent + Vertex + FileBrowser 刷流引擎${NC}"
 echo -e "${YELLOW}   💡 GitHub：https://github.com/yimouleng/Auto-Seedbox-PT ${NC}"
