@@ -8,7 +8,10 @@
 # 参数说明:
 #   -u : 用户名 (用于运行服务和登录WebUI)
 #   -p : 密码（必须 ≥ 12 位）
-#   -c : qBittorrent 缓存大小 (MiB, 仅4.x有效, 5.x使用mmap)
+#   -c : 显式指定 qB 缓存/工作集大小 (MiB)
+#        - 4.x: 作为 disk_cache 使用
+#        - 5.x: 作为 memory_working_set_limit 使用
+#        不传则走默认保守策略
 #   -q : qBittorrent 版本 (4, 4.3.9, 5, 5.0.4, latest, 或精确小版本如 5.1.2)
 #   -v : 安装 Vertex
 #   -f : 安装 FileBrowser (含 MediaInfo 扩展)
@@ -50,6 +53,7 @@ DO_FB=false
 DO_TUNE=false
 CUSTOM_PORT=false
 CACHE_SET_BY_USER=false
+QB_EXPLICIT_CACHE_MODE=false
 TUNE_MODE="1"
 AUTOTUNE_ENABLE=false
 
@@ -1241,7 +1245,14 @@ EOF
 
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
         local io_mode=1
+        local total_mem_mb
+        total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+
         if [[ "$disk_class" == "ssd" && "$TUNE_MODE" == "1" ]]; then
+            io_mode=0
+        fi
+
+        if [[ "${QB_EXPLICIT_CACHE_MODE:-false}" == "true" && "$disk_class" == "ssd" && $total_mem_mb -ge 8192 ]]; then
             io_mode=0
         fi
 
@@ -1403,6 +1414,9 @@ EOF
         if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
             local io_mode=1
             if [[ "$disk_class" == "ssd" && "$TUNE_MODE" == "1" ]]; then
+                io_mode=0
+            fi
+            if [[ "${QB_EXPLICIT_CACHE_MODE:-false}" == "true" && "$disk_class" == "ssd" && $mem_gb_qbit -ge 8 ]]; then
                 io_mode=0
             fi
             patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":$io_mode,\"disk_io_write_mode\":$io_mode,\"hashing_threads\":$hash_threads"
@@ -2078,6 +2092,7 @@ while [[ $# -gt 0 ]]; do
             QB_CACHE="$2"
             [[ "$QB_CACHE" =~ ^[0-9]+$ ]] || log_err "参数 -c/--cache 必须是数字 (MiB)。"
             CACHE_SET_BY_USER=true
+            QB_EXPLICIT_CACHE_MODE=true
             shift 2
             ;;
         -q|--qbit) QB_VER_REQ="$2"; shift 2 ;;
