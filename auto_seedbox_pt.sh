@@ -894,7 +894,7 @@ mem_avail_mb=$((mem_avail_kb / 1024))
 psi_full_avg10="0.00"
 psi_available=0
 if [[ -r /proc/pressure/memory ]]; then
-  psi_full_avg10=$(awk '/^full /{for(i=1;i<=NF;i++){if($i ~ /^avg10=/){split($i,a,"="); print a[2]; exit}}} END{print "0.00"}' /proc/pressure/memory)
+  psi_full_avg10=$(awk '/^full /{for(i=1;i<=NF;i++){if($i ~ /^avg10=/){split($i,a,"="); print a[2]; found=1; exit}}} END{if(!found) print "0.00"}' /proc/pressure/memory)
   psi_available=1
 else
   if [[ ! -f "$PSI_WARN_ONCE" ]]; then
