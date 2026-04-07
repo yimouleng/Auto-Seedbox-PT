@@ -53,6 +53,9 @@ CACHE_SET_BY_USER=false
 TUNE_MODE="1"
 AUTOTUNE_ENABLE=false
 
+FIREWALL_AUTO=true
+FIREWALL_RULES=()
+
 VX_RESTORE_URL=""
 VX_ZIP_PASS=""
 INSTALLED_MAJOR_VER="5"
@@ -152,9 +155,66 @@ wait_for_lock() {
     done
 }
 
+register_firewall_rule() {
+    local port=$1
+    local proto=${2:-tcp}
+    local rule="${port}/${proto}"
+    local existing
+    for existing in "${FIREWALL_RULES[@]:-}"; do
+        [[ "$existing" == "$rule" ]] && return 0
+    done
+    FIREWALL_RULES+=("$rule")
+}
+
+is_interactive_mode() {
+    [[ -t 0 && -t 1 && -r /dev/tty ]]
+}
+
+configure_firewall_policy() {
+    FIREWALL_RULES=()
+    register_firewall_rule "$QB_WEB_PORT" tcp
+    register_firewall_rule "$QB_BT_PORT" tcp
+    register_firewall_rule "$QB_BT_PORT" udp
+    [[ "$DO_VX" == "true" ]] && register_firewall_rule "$VX_PORT" tcp
+    [[ "$DO_FB" == "true" ]] && register_firewall_rule "$FB_PORT" tcp
+
+    if is_interactive_mode; then
+        echo -e "${YELLOW}=================================================${NC}"
+        echo -e "${YELLOW} 提示: 脚本可自动放行以下防火墙端口 ${NC}"
+        local rule
+        for rule in "${FIREWALL_RULES[@]}"; do
+            echo -e "  - ${CYAN}${rule}${NC}"
+        done
+        echo -e "${YELLOW}=================================================${NC}"
+
+        local fw_answer
+        read -r -p "是否自动开放这些端口？ [Y/n]: " fw_answer < /dev/tty || true
+        fw_answer=${fw_answer:-Y}
+        if [[ "$fw_answer" =~ ^[Yy]$ ]]; then
+            FIREWALL_AUTO=true
+            log_info "已选择自动配置防火墙规则。"
+        else
+            FIREWALL_AUTO=false
+            log_warn "已跳过自动配置防火墙，请按上面的端口列表手动放行。"
+        fi
+    else
+        FIREWALL_AUTO=true
+        log_warn "当前为非交互模式：脚本将自动开放以下防火墙端口。"
+        local rule
+        for rule in "${FIREWALL_RULES[@]}"; do
+            log_warn "  - ${rule}"
+        done
+    fi
+}
+
 open_port() {
     local port=$1
     local proto=${2:-tcp}
+    register_firewall_rule "$port" "$proto"
+
+    if [[ "$FIREWALL_AUTO" != "true" ]]; then
+        return 0
+    fi
 
     if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
         ufw allow "$port/$proto" >/dev/null 2>&1 || true
@@ -1030,7 +1090,6 @@ EOF_AUTOTUNE
 [Unit]
 Description=ASP qBittorrent AutoTune (M1)
 After=network.target qbittorrent-nox@${APP_USER}.service
-Wants=qbittorrent-nox@${APP_USER}.service
 
 [Service]
 Type=oneshot
@@ -2051,7 +2110,7 @@ echo -e "${CYAN}       / _ | / __/ |/ _ \\ ${NC}"
 echo -e "${CYAN}      / __ |_\\ \\  / ___/ ${NC}"
 echo -e "${CYAN}     /_/ |_/___/ /_/     ${NC}"
 echo -e "${BLUE}================================================================${NC}"
-echo -e "${PURPLE}     ✦ Auto-Seedbox-PT (ASP) 极限部署引擎 v3.5.6 ✦${NC}"
+echo -e "${PURPLE}     ✦ Auto-Seedbox-PT (ASP) 极限部署引擎 v3.6.0 ✦${NC}"
 echo -e "${PURPLE}     ✦               作者：Supcutie              ✦${NC}"
 echo -e "${GREEN}    🚀 一键部署 qBittorrent + Vertex + FileBrowser 刷流引擎${NC}"
 echo -e "${YELLOW}   💡 GitHub：https://github.com/yimouleng/Auto-Seedbox-PT ${NC}"
@@ -2175,6 +2234,8 @@ export MI_PORT=${MI_PORT:-8082}
 export SS_PORT=${SS_PORT:-8083}
 EOF
 chmod 600 "$ASP_ENV_FILE"
+
+configure_firewall_policy
 
 # 若用户显式传入 -a，则写入 opt-in 标记（用于开机 PSI 探测后自动启用 timer）
 if [[ "$AUTOTUNE_ENABLE" == "true" ]]; then
