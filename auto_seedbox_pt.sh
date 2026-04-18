@@ -35,6 +35,7 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+ASP_VERSION="3.7.1"
 
 QB_WEB_PORT=8080
 QB_BT_PORT=47878
@@ -299,6 +300,159 @@ detect_download_disk_class() {
 
     rota=$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null || echo "0")
     [[ "$rota" == "1" ]] && echo "hdd" || echo "ssd"
+}
+
+get_total_mem_mb() {
+    free -m | awk '/^Mem:/{print $2}'
+}
+
+detect_qb_profile() {
+    local disk_class="${1:-ssd}"
+    local total_mem_mb="${2:-$(get_total_mem_mb)}"
+    local virt_type
+
+    QB_PROFILE_AIO=8
+    QB_PROFILE_LOW_BUFFER=3072
+    QB_PROFILE_BUFFER=15360
+    QB_PROFILE_FACTOR=200
+    QB_PROFILE_IO_MODE=1
+
+    virt_type=$(systemd-detect-virt 2>/dev/null || echo "none")
+    [[ -d "/proc/vz" ]] && virt_type="openvz"
+
+    if [[ "$virt_type" != "none" && "$virt_type" != "unknown" ]]; then
+        :
+    elif [[ "$disk_class" == "ssd" ]]; then
+        QB_PROFILE_AIO=12
+        QB_PROFILE_LOW_BUFFER=5120
+        QB_PROFILE_BUFFER=20480
+        QB_PROFILE_FACTOR=250
+        QB_PROFILE_IO_MODE=0
+    else
+        QB_PROFILE_AIO=4
+        QB_PROFILE_LOW_BUFFER=3072
+        QB_PROFILE_BUFFER=10240
+        QB_PROFILE_FACTOR=150
+        QB_PROFILE_IO_MODE=1
+    fi
+
+    if (( total_mem_mb < 6144 )); then
+        [[ $QB_PROFILE_AIO -gt 4 ]] && QB_PROFILE_AIO=4
+        QB_PROFILE_LOW_BUFFER=3072
+        QB_PROFILE_BUFFER=10240
+        QB_PROFILE_FACTOR=150
+        QB_PROFILE_IO_MODE=1
+    fi
+}
+
+choose_default_qb_cache() {
+    local total_mem_mb="${1:-$(get_total_mem_mb)}"
+    local mode="${2:-1}"
+
+    if (( total_mem_mb <= 4096 )); then
+        [[ "$mode" == "1" ]] && echo 512 || echo 384
+    elif (( total_mem_mb <= 8192 )); then
+        [[ "$mode" == "1" ]] && echo 1024 || echo 768
+    elif (( total_mem_mb <= 16384 )); then
+        [[ "$mode" == "1" ]] && echo 2048 || echo 1536
+    elif (( total_mem_mb <= 32768 )); then
+        [[ "$mode" == "1" ]] && echo 3072 || echo 2048
+    elif (( total_mem_mb <= 65536 )); then
+        [[ "$mode" == "1" ]] && echo 4096 || echo 3072
+    elif (( total_mem_mb <= 131072 )); then
+        [[ "$mode" == "1" ]] && echo 8192 || echo 6144
+    elif (( total_mem_mb <= 262144 )); then
+        [[ "$mode" == "1" ]] && echo 12288 || echo 8192
+    else
+        [[ "$mode" == "1" ]] && echo 16384 || echo 12288
+    fi
+}
+
+qb_api_wait_ready() {
+    local attempts="${1:-30}"
+    local delay="${2:-2}"
+    local restarted="false"
+    local i
+
+    for ((i=1; i<=attempts; i++)); do
+        if curl -fsS --max-time 2 "http://127.0.0.1:${QB_WEB_PORT}/api/v2/app/version" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if [[ "$restarted" == "false" && $i -eq $((attempts / 2)) ]]; then
+            systemctl restart "qbittorrent-nox@$APP_USER" >/dev/null 2>&1 || true
+            restarted="true"
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
+
+qb_api_login() {
+    local cookie_file="$1"
+    local attempt response
+
+    rm -f "$cookie_file" 2>/dev/null || true
+    for attempt in 1 2 3; do
+        response=$(curl -fsS -c "$cookie_file" --max-time 6 \
+            --data-urlencode "username=$APP_USER" \
+            --data-urlencode "password=$APP_PASS" \
+            "http://127.0.0.1:${QB_WEB_PORT}/api/v2/auth/login" 2>/dev/null || true)
+        [[ "$response" == "Ok." ]] && return 0
+        sleep "$attempt"
+    done
+    return 1
+}
+
+qb_api_get_preferences() {
+    local cookie_file="$1"
+    local output_file="$2"
+
+    curl -fsS -b "$cookie_file" --max-time 8 \
+        "http://127.0.0.1:${QB_WEB_PORT}/api/v2/app/preferences" > "$output_file"
+}
+
+qb_api_set_preferences() {
+    local cookie_file="$1"
+    local payload_file="$2"
+    local http_code
+
+    http_code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 8 \
+        -b "$cookie_file" \
+        -X POST \
+        --data-urlencode "json@${payload_file}" \
+        "http://127.0.0.1:${QB_WEB_PORT}/api/v2/app/setPreferences" || echo "000")
+    [[ "$http_code" == "200" ]]
+}
+
+qb_api_apply_preferences() {
+    local patch_file="$1"
+    local cookie_file="$TEMP_DIR/qb_cookie.txt"
+    local current_pref="$TEMP_DIR/current_pref.json"
+    local final_pref="$TEMP_DIR/final_pref.json"
+    local attempt
+
+    qb_api_wait_ready 30 2 || return 1
+
+    for attempt in 1 2 3; do
+        qb_api_login "$cookie_file" || { sleep "$attempt"; continue; }
+        qb_api_get_preferences "$cookie_file" "$current_pref" || { sleep "$attempt"; continue; }
+
+        if command -v jq >/dev/null 2>&1; then
+            jq -s '.[0] * .[1]' "$current_pref" "$patch_file" > "$final_pref" 2>/dev/null || cp "$patch_file" "$final_pref"
+        else
+            cp "$patch_file" "$final_pref"
+        fi
+
+        if qb_api_set_preferences "$cookie_file" "$final_pref"; then
+            rm -f "$cookie_file" "$current_pref" "$final_pref"
+            return 0
+        fi
+        sleep "$attempt"
+    done
+
+    rm -f "$cookie_file" "$current_pref" "$final_pref"
+    return 1
 }
 
 # ================= 2. 用户管理 =================
@@ -846,19 +1000,17 @@ EOF
 fi
 chmod 600 "$PSI_FLAG_FILE" "$PSI_ENV_FILE" 2>/dev/null || true
 
-# 若 PSI 可用，则尝试自动启用 M1 动态控制器 timer（仅当 unit 存在）
-if [[ "$psi_ok" == "1" ]]; then
-  # 仅当用户已 opt-in（传过 -a）时，才自动启用动态控制器 timer
-  if [[ -f "/etc/asp_autotune_optin" ]]; then
-    if [[ -f "$AUTOTUNE_TMR" && -f "$AUTOTUNE_ENV" ]]; then
-      systemctl daemon-reload >/dev/null 2>&1 || true
+# 仅当用户已 opt-in（传过 -a）时，自动启用动态控制器 timer。
+# PSI 仅决定是否可读取压力指标；若 PSI 不可用，控制器会自动回退到 MemAvailable-only。
+if [[ -f "/etc/asp_autotune_optin" ]]; then
+  if [[ -f "$AUTOTUNE_TMR" && -f "$AUTOTUNE_ENV" ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
 
-      if ! systemctl is-enabled --quiet "$AUTOTUNE_TMR_UNIT" 2>/dev/null; then
-        systemctl enable "$AUTOTUNE_TMR_UNIT" >/dev/null 2>&1 || true
-      fi
-      if ! systemctl is-active --quiet "$AUTOTUNE_TMR_UNIT" 2>/dev/null; then
-        systemctl start "$AUTOTUNE_TMR_UNIT" >/dev/null 2>&1 || true
-      fi
+    if ! systemctl is-enabled --quiet "$AUTOTUNE_TMR_UNIT" 2>/dev/null; then
+      systemctl enable "$AUTOTUNE_TMR_UNIT" >/dev/null 2>&1 || true
+    fi
+    if ! systemctl is-active --quiet "$AUTOTUNE_TMR_UNIT" 2>/dev/null; then
+      systemctl start "$AUTOTUNE_TMR_UNIT" >/dev/null 2>&1 || true
     fi
   fi
 fi
@@ -891,35 +1043,26 @@ EOF
 # ================= 4.1 动态控制器（仅 Mode 1，需 -a） =================
 
 install_autotune_m1() {
-    # 说明：为解决“PSI 后开导致 timer/unit 不存在”的鸡与蛋问题，
-    #      这里在 Mode 1 下始终生成 M1 控制器相关文件（脚本/service/timer/env），
-    #      但仅在用户显式开启(-a)或当前已检测到 PSI 可用时才立即启用 timer。
     [[ "$TUNE_MODE" == "1" ]] || return 0
 
-    local disk_class
+    local disk_class total_mem_mb
     disk_class=$(detect_download_disk_class "$HB/Downloads")
-
-    local is_g95="false"
-    if is_g95_preset; then
-        is_g95="true"
-    fi
+    total_mem_mb=$(get_total_mem_mb)
+    detect_qb_profile "$disk_class" "$total_mem_mb"
 
     cat > "$AUTOTUNE_ENV" << EOF
 QB_WEB_PORT=$QB_WEB_PORT
 APP_USER=$APP_USER
 APP_PASS=$APP_PASS
 DISK_CLASS=$disk_class
-IS_G95=$is_g95
 INSTALLED_MAJOR_VER=$INSTALLED_MAJOR_VER
-
-AUTOTUNE_MEM_LOW_PCT=12
-AUTOTUNE_MEM_HIGH_PCT=20
+BASE_AIO=$QB_PROFILE_AIO
+BASE_LOW_BUFFER=$QB_PROFILE_LOW_BUFFER
+BASE_BUFFER=$QB_PROFILE_BUFFER
+BASE_FACTOR=$QB_PROFILE_FACTOR
+AUTOTUNE_MEM_LOW_PCT=10
 AUTOTUNE_MEM_LOW_FLOOR_MB=768
-AUTOTUNE_MEM_HIGH_FLOOR_MB=1024
-
 AUTOTUNE_PSI_GUARD=0.02
-AUTOTUNE_PSI_BOOST=0.005
-
 AUTOTUNE_LOGGER_TAG=asp-qb-autotune
 EOF
     chmod 600 "$AUTOTUNE_ENV"
@@ -945,7 +1088,39 @@ flock -n 9 || exit 0
 TAG="${AUTOTUNE_LOGGER_TAG:-asp-qb-autotune}"
 QBIT_URL="http://127.0.0.1:${QB_WEB_PORT}"
 
-# API 存活
+qb_cookie_valid() {
+  [[ -s "$COOKIE_FILE" ]] || return 1
+  curl -fsS -b "$COOKIE_FILE" --max-time 4 "${QBIT_URL}/api/v2/app/preferences" >/dev/null 2>&1
+}
+
+qb_login() {
+  local attempt response
+  rm -f "$COOKIE_FILE" 2>/dev/null || true
+  for attempt in 1 2 3; do
+    response=$(curl -fsS -c "$COOKIE_FILE" --max-time 6 \
+      --data-urlencode "username=${APP_USER}" \
+      --data-urlencode "password=${APP_PASS}" \
+      "${QBIT_URL}/api/v2/auth/login" 2>/dev/null || true)
+    [[ "$response" == "Ok." ]] && return 0
+    sleep "$attempt"
+  done
+  return 1
+}
+
+qb_ensure_login() {
+  qb_cookie_valid && return 0
+  qb_login
+}
+
+qb_apply_patch() {
+  local payload_file="$1"
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 6 -b "$COOKIE_FILE" \
+    -X POST --data-urlencode "json@${payload_file}" \
+    "${QBIT_URL}/api/v2/app/setPreferences" || echo "000")
+  [[ "$code" == "200" ]]
+}
+
 if ! curl -fsS --max-time 2 "${QBIT_URL}/api/v2/app/version" >/dev/null 2>&1; then
   exit 0
 fi
@@ -955,11 +1130,11 @@ mem_avail_kb=$(grep -m1 '^MemAvailable:' /proc/meminfo | awk '{print $2}')
 mem_total_mb=$((mem_total_kb / 1024))
 mem_avail_mb=$((mem_avail_kb / 1024))
 
-psi_full_avg10="0.00"
 psi_available=0
+psi_full_avg10="0.00"
 if [[ -r /proc/pressure/memory ]]; then
-  psi_full_avg10=$(awk '/^full /{for(i=1;i<=NF;i++){if($i ~ /^avg10=/){split($i,a,"="); print a[2]; found=1; exit}}} END{if(!found) print "0.00"}' /proc/pressure/memory)
   psi_available=1
+  psi_full_avg10=$(awk '/^full /{for(i=1;i<=NF;i++){if($i ~ /^avg10=/){split($i,a,"="); print a[2]; found=1; exit}}} END{if(!found) print "0.00"}' /proc/pressure/memory)
 else
   if [[ ! -f "$PSI_WARN_ONCE" ]]; then
     logger -t "$TAG" "PSI not available; falling back to MemAvailable-only control."
@@ -967,126 +1142,93 @@ else
   fi
 fi
 
-mem_low_pct=${AUTOTUNE_MEM_LOW_PCT:-12}
-mem_high_pct=${AUTOTUNE_MEM_HIGH_PCT:-20}
-mem_low_floor=${AUTOTUNE_MEM_LOW_FLOOR_MB:-768}
-mem_high_floor=${AUTOTUNE_MEM_HIGH_FLOOR_MB:-1024}
+low_mb=$(( mem_total_mb * ${AUTOTUNE_MEM_LOW_PCT:-10} / 100 ))
+(( low_mb < ${AUTOTUNE_MEM_LOW_FLOOR_MB:-768} )) && low_mb=${AUTOTUNE_MEM_LOW_FLOOR_MB:-768}
 
-low_mb=$(( mem_total_mb * mem_low_pct / 100 ))
-high_mb=$(( mem_total_mb * mem_high_pct / 100 ))
-(( low_mb < mem_low_floor )) && low_mb=$mem_low_floor
-(( high_mb < mem_high_floor )) && high_mb=$mem_high_floor
-
-psi_guard=${AUTOTUNE_PSI_GUARD:-0.02}
-psi_boost=${AUTOTUNE_PSI_BOOST:-0.005}
-
+psi_guard_int=$(python3 - <<PY
+v=float("${AUTOTUNE_PSI_GUARD:-0.02}")
+print(int(v*1000))
+PY
+)
 psi_full_int=$(python3 - <<PY
 v=float("$psi_full_avg10")
 print(int(v*1000))
 PY
 )
 
-psi_guard_int=$(python3 - <<PY
-v=float("$psi_guard")
-print(int(v*1000))
-PY
-)
-
-psi_boost_int=$(python3 - <<PY
-v=float("$psi_boost")
-print(int(v*1000))
-PY
-)
-
-prev="normal"
-if [[ -f "$STATE_FILE" ]]; then
-  prev=$(cat "$STATE_FILE" 2>/dev/null || echo "normal")
-fi
-
-want="$prev"
+want="baseline"
 if (( mem_avail_mb <= low_mb )) || (( psi_available == 1 && psi_full_int >= psi_guard_int )); then
   want="guard"
-elif (( mem_avail_mb >= high_mb )) && (( psi_available == 0 || psi_full_int <= psi_boost_int )); then
-  want="boost"
-else
-  if [[ "$prev" == "guard" ]]; then
-    want="guard"
-  elif [[ "$prev" == "boost" ]]; then
-    want="boost"
-  else
-    want="normal"
-  fi
 fi
 
-# 基线/爆发/护栏：仅调关键旋钮
-if [[ "${DISK_CLASS:-ssd}" == "hdd" ]]; then
-  NORMAL_CS=1200; BOOST_CS=1600; GUARD_CS=500
-  NORMAL_HO=180;  BOOST_HO=240;  GUARD_HO=80
-  NORMAL_PTT=180; BOOST_PTT=220; GUARD_PTT=80
-  NORMAL_SB=10240; BOOST_SB=15360; GUARD_SB=5120
-  NORMAL_SBF=150; BOOST_SBF=180; GUARD_SBF=120
-else
-  NORMAL_CS=1500; BOOST_CS=2000; GUARD_CS=600
-  NORMAL_HO=240;  BOOST_HO=320;  GUARD_HO=120
-  NORMAL_PTT=250; BOOST_PTT=320; GUARD_PTT=120
-  NORMAL_SB=20480; BOOST_SB=30720; GUARD_SB=10240
-  NORMAL_SBF=250; BOOST_SBF=300; GUARD_SBF=150
-fi
-
-if (( mem_total_mb < 6144 )); then
-  NORMAL_CS=900; BOOST_CS=1200; GUARD_CS=450
-  NORMAL_HO=120; BOOST_HO=160; GUARD_HO=60
-  NORMAL_PTT=120; BOOST_PTT=160; GUARD_PTT=60
-  NORMAL_SB=10240; BOOST_SB=15360; GUARD_SB=5120
-  NORMAL_SBF=150; BOOST_SBF=180; GUARD_SBF=120
-fi
-
-if [[ "${IS_G95:-false}" == "true" ]]; then
-  if [[ "${DISK_CLASS:-ssd}" != "hdd" ]]; then
-    NORMAL_CS=1700; BOOST_CS=2200; GUARD_CS=650
-    NORMAL_HO=260;  BOOST_HO=340;  GUARD_HO=130
-    NORMAL_PTT=280; BOOST_PTT=360; GUARD_PTT=130
-    NORMAL_SB=20480; BOOST_SB=32768; GUARD_SB=10240
-    NORMAL_SBF=250; BOOST_SBF=320; GUARD_SBF=150
-  else
-    NORMAL_CS=1300; BOOST_CS=1700; GUARD_CS=550
-  fi
-fi
-
-case "$want" in
-  boost) CS=$BOOST_CS; HO=$BOOST_HO; PTT=$BOOST_PTT; SB=$BOOST_SB; SBF=$BOOST_SBF ;;
-  guard) CS=$GUARD_CS; HO=$GUARD_HO; PTT=$GUARD_PTT; SB=$GUARD_SB; SBF=$GUARD_SBF ;;
-  *)     CS=$NORMAL_CS; HO=$NORMAL_HO; PTT=$NORMAL_PTT; SB=$NORMAL_SB; SBF=$NORMAL_SBF ;;
-esac
-
+prev="baseline"
+[[ -f "$STATE_FILE" ]] && prev=$(cat "$STATE_FILE" 2>/dev/null || echo "baseline")
 [[ "$want" == "$prev" ]] && exit 0
 
-rm -f "$COOKIE_FILE" 2>/dev/null || true
-curl -fsS -c "$COOKIE_FILE" --max-time 5 \
-  --data-urlencode "username=${APP_USER}" \
-  --data-urlencode "password=${APP_PASS}" \
-  "${QBIT_URL}/api/v2/auth/login" >/dev/null 2>&1 || exit 0
+if (( mem_total_mb <= 4096 )); then
+  BASE_CS=700; BASE_HO=120; BASE_PTT=120
+  GUARD_CS=320; GUARD_HO=60; GUARD_PTT=60
+elif (( mem_total_mb <= 8192 )); then
+  BASE_CS=1000; BASE_HO=160; BASE_PTT=160
+  GUARD_CS=420; GUARD_HO=80; GUARD_PTT=80
+elif (( mem_total_mb <= 16384 )); then
+  BASE_CS=1300; BASE_HO=220; BASE_PTT=220
+  GUARD_CS=560; GUARD_HO=110; GUARD_PTT=110
+elif (( mem_total_mb <= 32768 )); then
+  BASE_CS=1600; BASE_HO=280; BASE_PTT=280
+  GUARD_CS=720; GUARD_HO=140; GUARD_PTT=140
+elif (( mem_total_mb <= 65536 )); then
+  BASE_CS=1900; BASE_HO=360; BASE_PTT=360
+  GUARD_CS=900; GUARD_HO=180; GUARD_PTT=180
+elif (( mem_total_mb <= 131072 )); then
+  BASE_CS=2200; BASE_HO=440; BASE_PTT=440
+  GUARD_CS=1100; GUARD_HO=220; GUARD_PTT=220
+elif (( mem_total_mb <= 262144 )); then
+  BASE_CS=2500; BASE_HO=520; BASE_PTT=520
+  GUARD_CS=1250; GUARD_HO=260; GUARD_PTT=260
+else
+  BASE_CS=2800; BASE_HO=600; BASE_PTT=600
+  GUARD_CS=1400; GUARD_HO=300; GUARD_PTT=300
+fi
 
-PATCH=$(python3 - <<PY
+if [[ "${DISK_CLASS:-ssd}" == "hdd" ]]; then
+  (( BASE_CS > 1200 )) && BASE_CS=1200
+  (( GUARD_CS > 600 )) && GUARD_CS=600
+fi
+
+if [[ "$want" == "guard" ]]; then
+  CS=$GUARD_CS; HO=$GUARD_HO; PTT=$GUARD_PTT
+  SB=$(( BASE_BUFFER / 2 ))
+  SBF=150
+  AIO=$(( BASE_AIO > 4 ? 4 : BASE_AIO ))
+else
+  CS=$BASE_CS; HO=$BASE_HO; PTT=$BASE_PTT
+  SB=$BASE_BUFFER
+  SBF=$BASE_FACTOR
+  AIO=$BASE_AIO
+fi
+
+PATCH_FILE=$(mktemp)
+python3 - <<PY > "$PATCH_FILE"
 import json
 patch = {
   "connection_speed": int(${CS}),
   "max_half_open_connections": int(${HO}),
   "max_connec_per_torrent": int(${PTT}),
+  "send_buffer_low_watermark": int(${BASE_LOW_BUFFER}),
   "send_buffer_watermark": int(${SB}),
   "send_buffer_watermark_factor": int(${SBF}),
+  "async_io_threads": int(${AIO}),
 }
 print(json.dumps(patch, separators=(",",":")))
 PY
-)
 
-http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -b "$COOKIE_FILE" \
-  -X POST --data-urlencode "json=$PATCH" "${QBIT_URL}/api/v2/app/setPreferences" || echo "000")
-
-if [[ "$http_code" == "200" ]]; then
+if qb_ensure_login && qb_apply_patch "$PATCH_FILE"; then
   echo "$want" > "$STATE_FILE"
-  logger -t "$TAG" "state=${want} prev=${prev} memAvailMB=${mem_avail_mb} psiFullAvg10=${psi_full_avg10} cs=${CS} ho=${HO} ptt=${PTT} sb=${SB} sbf=${SBF}"
+  logger -t "$TAG" "state=${want} prev=${prev} memAvailMB=${mem_avail_mb} psiFullAvg10=${psi_full_avg10} cs=${CS} ho=${HO} ptt=${PTT} sb=${SB} sbf=${SBF} aio=${AIO}"
 fi
+
+rm -f "$PATCH_FILE"
 EOF_AUTOTUNE
     chmod +x "$AUTOTUNE_BIN"
 
@@ -1105,10 +1247,11 @@ EOF
 Description=ASP qBittorrent AutoTune Timer (M1)
 
 [Timer]
-OnBootSec=30
-OnUnitActiveSec=120
-AccuracySec=1
+OnBootSec=60
+OnUnitActiveSec=180
+AccuracySec=5
 Unit=asp-qb-autotune.service
+Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -1116,26 +1259,18 @@ EOF
 
     systemctl daemon-reload
 
-# 仅在用户显式开启(-a)或当前系统已支持 PSI 时，立即启用/启动 timer。
-# 否则只生成文件，等待 asp-psi-detect.service 在后续 PSI 可用的开机阶段自动启用。
-local psi_now="false"
-if [[ -r /proc/pressure/memory ]] && head -n 1 /proc/pressure/memory >/dev/null 2>&1; then
-    psi_now="true"
-fi
+    local optin="false"
+    if [[ "$AUTOTUNE_ENABLE" == "true" ]] || [[ -f "$AUTOTUNE_OPTIN_FLAG" ]]; then
+        optin="true"
+    fi
 
-# 仅在用户显式开启(-a)（opt-in）时允许启用；PSI 仅作为“可启用”的必要条件之一
-local optin="false"
-if [[ "$AUTOTUNE_ENABLE" == "true" ]] || [[ -f "$AUTOTUNE_OPTIN_FLAG" ]]; then
-    optin="true"
-fi
-
-if [[ "$optin" == "true" && "$psi_now" == "true" ]]; then
-    systemctl enable asp-qb-autotune.timer >/dev/null 2>&1 || true
-    systemctl restart asp-qb-autotune.timer >/dev/null 2>&1 || true
-    log_info "已启用 M1 动态控制器：asp-qb-autotune.timer"
-else
-    log_info "已生成 M1 动态控制器文件（未启用）。需 -a 且系统支持 PSI 时才会启用；若后续开启 PSI，可重跑脚本或由开机探测在 opt-in 后自动启用。"
-fi
+    if [[ "$optin" == "true" ]]; then
+        systemctl enable asp-qb-autotune.timer >/dev/null 2>&1 || true
+        systemctl restart asp-qb-autotune.timer >/dev/null 2>&1 || true
+        log_info "已启用 M1 动态控制器：asp-qb-autotune.timer"
+    else
+        log_info "已生成 M1 动态控制器文件（未启用）。需 -a 才会启用；开启后仅在内存/PSI 压力升高时临时收紧，PSI 不可用时自动回退为 MemAvailable-only。"
+    fi
 }
 
 # ================= 5. 应用部署 =================
@@ -1150,7 +1285,7 @@ install_qbit() {
     url=""
     api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
 
-    local hash_threads
+    local hash_threads total_mem_mb disk_class cache_val config_file pass_hash patch_file service_extra
     hash_threads=$(nproc 2>/dev/null || echo 2)
 
     if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
@@ -1191,36 +1326,18 @@ install_qbit() {
     rm -f "$HB/.config/qBittorrent/qBittorrent.conf.lock"
     rm -f "$HB/.local/share/qBittorrent/BT_backup/.lock"
 
-    local pass_hash
     pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
 
-    local disk_class
     disk_class=$(detect_download_disk_class "$HB/Downloads")
+    total_mem_mb=$(get_total_mem_mb)
+    detect_qb_profile "$disk_class" "$total_mem_mb"
 
     if [[ "${CACHE_SET_BY_USER:-false}" == "false" ]]; then
-        local total_mem_mb
-        total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            if [[ "$INSTALLED_MAJOR_VER" == "4" ]]; then
-                QB_CACHE=$(( total_mem_mb / 8 ))
-            else
-                QB_CACHE=$(( total_mem_mb / 4 ))
-            fi
-        else
-            if [[ "$INSTALLED_MAJOR_VER" == "4" ]]; then
-                QB_CACHE=$(( total_mem_mb / 12 ))
-            else
-                QB_CACHE=$(( total_mem_mb / 6 ))
-            fi
-        fi
-
-        [[ $QB_CACHE -lt 256 ]] && QB_CACHE=256
-        [[ "$TUNE_MODE" == "2" && $QB_CACHE -gt 2048 ]] && QB_CACHE=2048
+        QB_CACHE=$(choose_default_qb_cache "$total_mem_mb" "$TUNE_MODE")
     fi
 
-    local cache_val="$QB_CACHE"
-    local config_file="$HB/.config/qBittorrent/qBittorrent.conf"
+    cache_val="$QB_CACHE"
+    config_file="$HB/.config/qBittorrent/qBittorrent.conf"
 
     cat > "$config_file" << EOF
 [LegalNotice]
@@ -1244,36 +1361,31 @@ Connection\PortRangeMin=$QB_BT_PORT
 EOF
 
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-        local io_mode=1
-        local total_mem_mb
-        total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-
-        if [[ "$disk_class" == "ssd" && "$TUNE_MODE" == "1" ]]; then
-            io_mode=0
-        fi
-
-        if [[ "${QB_EXPLICIT_CACHE_MODE:-false}" == "true" && "$disk_class" == "ssd" && $total_mem_mb -ge 8192 ]]; then
-            io_mode=0
-        fi
-
         cat >> "$config_file" << EOF
 Session\DiskIOType=2
-Session\DiskIOReadMode=$io_mode
-Session\DiskIOWriteMode=$io_mode
+Session\DiskIOReadMode=${QB_PROFILE_IO_MODE}
+Session\DiskIOWriteMode=${QB_PROFILE_IO_MODE}
 Session\MemoryWorkingSetLimit=$cache_val
 Session\HashingThreads=$hash_threads
+EOF
+    else
+        cat >> "$config_file" << EOF
+[BitTorrent]
+Session\AsyncIOThreadsCount=${QB_PROFILE_AIO}
+Session\SendBufferLowWatermark=${QB_PROFILE_LOW_BUFFER}
+Session\SendBufferWatermark=${QB_PROFILE_BUFFER}
+Session\SendBufferWatermarkFactor=${QB_PROFILE_FACTOR}
 EOF
     fi
 
     chown "$APP_USER:$APP_USER" "$config_file"
 
-    local total_mem_mb reserve_mb mem_limit_mb mem_high_mb
-    total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    reserve_mb=1024
-    [[ $total_mem_mb -le 4096 ]] && reserve_mb=768
-    mem_limit_mb=$((total_mem_mb - reserve_mb))
-    [[ $mem_limit_mb -lt 1024 ]] && mem_limit_mb=$((total_mem_mb * 80 / 100))
-    mem_high_mb=$((mem_limit_mb * 90 / 100))
+    service_extra=""
+    if [[ "$TUNE_MODE" == "2" && $total_mem_mb -le 8192 ]]; then
+        local memory_high_mb
+        memory_high_mb=$(( total_mem_mb * 75 / 100 ))
+        service_extra=$'\nMemoryAccounting=true\nMemoryHigh='"${memory_high_mb}"$'M'
+    fi
 
     cat > /etc/systemd/system/qbittorrent-nox@.service << EOF
 [Unit]
@@ -1286,175 +1398,108 @@ User=%i
 ExecStart=/usr/bin/qbittorrent-nox --webui-port=$QB_WEB_PORT
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
 LimitNOFILE=1048576
-
-OOMScoreAdjust=0
-MemoryAccounting=true
-MemoryHigh=${mem_high_mb}M
-MemoryMax=${mem_limit_mb}M
-MemoryLimit=${mem_limit_mb}M
+OOMScoreAdjust=0${service_extra}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload && systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
-    systemctl start "qbittorrent-nox@$APP_USER"
+    systemctl restart "qbittorrent-nox@$APP_USER"
     open_port "$QB_WEB_PORT"
     open_port "$QB_BT_PORT" "tcp"
     open_port "$QB_BT_PORT" "udp"
 
-    local api_ready=false
-    printf "\e[?25l"
-    for i in {1..20}; do
-        printf "\r\033[K ${CYAN}[⠧]${NC} 轮询探测 API 接口引擎存活状态... ($i/20)"
-        if curl -s -f --max-time 2 "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/version" >/dev/null; then
-            api_ready=true
-            break
-        fi
-        sleep 1
-    done
-    printf "\e[?25h"
+    patch_file="$TEMP_DIR/patch_pref.json"
+    python3 - "$patch_file" "$INSTALLED_MAJOR_VER" "$TUNE_MODE" "$cache_val" "$hash_threads" \
+        "$QB_PROFILE_AIO" "$QB_PROFILE_LOW_BUFFER" "$QB_PROFILE_BUFFER" "$QB_PROFILE_FACTOR" \
+        "$QB_PROFILE_IO_MODE" "$total_mem_mb" << 'PY'
+import json, sys
+out, major, mode, cache, hash_threads, aio, low, buf, factor, io_mode, total = sys.argv[1:12]
+major = str(major)
+mode = str(mode)
+cache = int(cache)
+hash_threads = int(hash_threads)
+aio = int(aio)
+low = int(low)
+buf = int(buf)
+factor = int(factor)
+io_mode = int(io_mode)
+total = int(total)
 
-    if [[ "$api_ready" == "true" ]]; then
-        printf "\r\033[K ${GREEN}[√]${NC} API 引擎握手成功！开始下发高级底层配置... \n"
+patch = {
+    "locale": "zh_CN",
+    "web_ui_language": "zh_CN",
+    "bittorrent_protocol": 1,
+    "dht": False,
+    "pex": False,
+    "lsd": False,
+    "announce_to_all_trackers": True,
+    "announce_to_all_tiers": True,
+    "queueing_enabled": False,
+    "bdecode_depth_limit": 10000,
+    "bdecode_token_limit": 10000000,
+    "strict_super_seeding": False,
+    "max_ratio_action": 0,
+    "max_ratio": -1,
+    "max_seeding_time": -1,
+    "file_pool_size": 5000 if total < 8192 else 8192,
+    "peer_tos": 2,
+    "async_io_threads": aio,
+    "send_buffer_low_watermark": low,
+    "send_buffer_watermark": buf,
+    "send_buffer_watermark_factor": factor,
+    "max_active_downloads": -1,
+    "max_active_uploads": -1,
+    "max_active_torrents": -1,
+}
 
-        curl -s -c "$TEMP_DIR/qb_cookie.txt" --max-time 5 \
-            --data-urlencode "username=$APP_USER" \
-            --data-urlencode "password=$APP_PASS" \
-            "http://127.0.0.1:$QB_WEB_PORT/api/v2/auth/login" >/dev/null
+if major == "5":
+    patch.update({
+        "memory_working_set_limit": cache,
+        "disk_io_type": 2,
+        "disk_io_read_mode": io_mode,
+        "disk_io_write_mode": io_mode,
+        "hashing_threads": hash_threads,
+    })
+else:
+    patch.update({"disk_cache": cache})
 
-        curl -s -b "$TEMP_DIR/qb_cookie.txt" --max-time 5 \
-            "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/preferences" > "$TEMP_DIR/current_pref.json"
+if mode != "1":
+    if total <= 4096:
+        mode_vals = dict(max_connec=1200, max_connec_per_torrent=80, max_uploads=250, max_uploads_per_torrent=25, max_half_open_connections=60, connection_speed=400, peer_timeout=120)
+    elif total <= 8192:
+        mode_vals = dict(max_connec=2000, max_connec_per_torrent=120, max_uploads=500, max_uploads_per_torrent=40, max_half_open_connections=100, connection_speed=700, peer_timeout=90)
+    elif total <= 16384:
+        mode_vals = dict(max_connec=3500, max_connec_per_torrent=180, max_uploads=900, max_uploads_per_torrent=60, max_half_open_connections=160, connection_speed=1000, peer_timeout=75)
+    elif total <= 32768:
+        mode_vals = dict(max_connec=6000, max_connec_per_torrent=240, max_uploads=1500, max_uploads_per_torrent=90, max_half_open_connections=240, connection_speed=1400, peer_timeout=60)
+    elif total <= 65536:
+        mode_vals = dict(max_connec=9000, max_connec_per_torrent=320, max_uploads=2400, max_uploads_per_torrent=120, max_half_open_connections=320, connection_speed=1700, peer_timeout=60)
+    elif total <= 131072:
+        mode_vals = dict(max_connec=12000, max_connec_per_torrent=380, max_uploads=3200, max_uploads_per_torrent=150, max_half_open_connections=400, connection_speed=1900, peer_timeout=60)
+    elif total <= 262144:
+        mode_vals = dict(max_connec=16000, max_connec_per_torrent=450, max_uploads=4200, max_uploads_per_torrent=180, max_half_open_connections=500, connection_speed=2100, peer_timeout=60)
+    else:
+        mode_vals = dict(max_connec=20000, max_connec_per_torrent=520, max_uploads=5200, max_uploads_per_torrent=200, max_half_open_connections=600, connection_speed=2200, peer_timeout=60)
+    patch.update(mode_vals)
+    patch.update({"upload_choking_algorithm": 0, "seed_choking_algorithm": 0})
 
-        local patch_json
-        patch_json="{\"locale\":\"zh_CN\",\"web_ui_language\":\"zh_CN\",\"bittorrent_protocol\":1,\"dht\":false,\"pex\":false,\"lsd\":false,\"announce_to_all_trackers\":true,\"announce_to_all_tiers\":true,\"queueing_enabled\":false,\"bdecode_depth_limit\":10000,\"bdecode_token_limit\":10000000,\"strict_super_seeding\":false,\"max_ratio_action\":0,\"max_ratio\":-1,\"max_seeding_time\":-1,\"file_pool_size\":5000,\"peer_tos\":2"
+with open(out, 'w', encoding='utf-8') as f:
+    json.dump(patch, f, separators=(",",":"))
+PY
 
-        local mem_kb_qbit mem_gb_qbit sb_low sb_buf sb_factor
-        mem_kb_qbit=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-        mem_gb_qbit=$((mem_kb_qbit / 1024 / 1024))
-
-        sb_low=3072
-        sb_buf=15360
-        sb_factor=200
-
-        if [[ "$disk_class" == "ssd" ]]; then
-            sb_low=3072
-            sb_buf=15360
-            sb_factor=300
-        else
-            sb_low=3072
-            sb_buf=10240
-            sb_factor=150
-        fi
-
-        if [[ $mem_gb_qbit -lt 6 ]]; then
-            sb_low=3072
-            sb_buf=10240
-            sb_factor=150
-        fi
-
-        if is_g95_preset && [[ "$disk_class" == "ssd" ]]; then
-            sb_low=3072
-            sb_buf=15360
-            sb_factor=300
-        fi
-
-        if [[ "$TUNE_MODE" == "1" ]]; then
-            local dyn_async_io dyn_max_connec dyn_max_connec_tor dyn_max_up dyn_max_up_tor dyn_half_open
-
-            dyn_async_io=$([[ "$disk_class" == "ssd" ]] && echo 8 || echo 4)
-
-            if [[ $mem_gb_qbit -ge 30 ]]; then
-                dyn_async_io=12
-                dyn_max_connec=30000
-                dyn_max_connec_tor=1000
-                dyn_max_up=10000
-                dyn_max_up_tor=300
-                dyn_half_open=1000
-                sb_buf=65536
-                sb_factor=320
-            elif [[ $mem_gb_qbit -ge 15 ]]; then
-                dyn_async_io=8
-                dyn_max_connec=10000
-                dyn_max_connec_tor=500
-                dyn_max_up=5000
-                dyn_max_up_tor=200
-                dyn_half_open=500
-            elif [[ $mem_gb_qbit -lt 6 ]]; then
-                dyn_async_io=4
-                dyn_max_connec=2000
-                dyn_max_connec_tor=100
-                dyn_max_up=500
-                dyn_max_up_tor=50
-                dyn_half_open=100
-            else
-                dyn_max_connec=4000
-                dyn_max_connec_tor=200
-                dyn_max_up=2000
-                dyn_max_up_tor=100
-                dyn_half_open=200
-
-                if is_g95_preset; then
-                    dyn_max_connec=6000
-                    dyn_max_up=2500
-                    dyn_half_open=250
-                fi
-            fi
-
-            patch_json="${patch_json},\"max_connec\":${dyn_max_connec},\"max_connec_per_torrent\":${dyn_max_connec_tor},\"max_uploads\":${dyn_max_up},\"max_uploads_per_torrent\":${dyn_max_up_tor},\"max_half_open_connections\":${dyn_half_open},\"send_buffer_watermark\":${sb_buf},\"send_buffer_low_watermark\":${sb_low},\"send_buffer_watermark_factor\":${sb_factor},\"connection_speed\":2000,\"peer_timeout\":45,\"upload_choking_algorithm\":1,\"seed_choking_algorithm\":1,\"async_io_threads\":${dyn_async_io},\"max_active_downloads\":-1,\"max_active_uploads\":-1,\"max_active_torrents\":-1"
-        else
-            local m2_async
-            m2_async=4
-            [[ "$disk_class" == "ssd" ]] && m2_async=8
-
-            patch_json="${patch_json},\"max_connec\":1500,\"max_connec_per_torrent\":100,\"max_uploads\":400,\"max_uploads_per_torrent\":40,\"max_half_open_connections\":80,\"send_buffer_watermark\":${sb_buf},\"send_buffer_low_watermark\":${sb_low},\"send_buffer_watermark_factor\":${sb_factor},\"connection_speed\":600,\"peer_timeout\":120,\"upload_choking_algorithm\":0,\"seed_choking_algorithm\":0,\"async_io_threads\":${m2_async}"
-        fi
-
-        if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
-            local io_mode=1
-            if [[ "$disk_class" == "ssd" && "$TUNE_MODE" == "1" ]]; then
-                io_mode=0
-            fi
-            if [[ "${QB_EXPLICIT_CACHE_MODE:-false}" == "true" && "$disk_class" == "ssd" && $mem_gb_qbit -ge 8 ]]; then
-                io_mode=0
-            fi
-            patch_json="${patch_json},\"memory_working_set_limit\":$cache_val,\"disk_io_type\":2,\"disk_io_read_mode\":$io_mode,\"disk_io_write_mode\":$io_mode,\"hashing_threads\":$hash_threads"
-        else
-            if [[ "$TUNE_MODE" == "1" ]]; then
-                patch_json="${patch_json},\"disk_cache\":$cache_val,\"disk_cache_ttl\":600"
-            else
-                patch_json="${patch_json},\"disk_cache\":$cache_val,\"disk_cache_ttl\":1200"
-            fi
-        fi
-
-        patch_json="${patch_json}}"
-        echo "$patch_json" > "$TEMP_DIR/patch_pref.json"
-
-        local final_payload="$patch_json"
-        if command -v jq >/dev/null && grep -q "{" "$TEMP_DIR/current_pref.json"; then
-            if jq -s '.[0] * .[1]' "$TEMP_DIR/current_pref.json" "$TEMP_DIR/patch_pref.json" > "$TEMP_DIR/final_pref.json" 2>/dev/null; then
-                if [[ -s "$TEMP_DIR/final_pref.json" && $(cat "$TEMP_DIR/final_pref.json") != "null" ]]; then
-                    final_payload=$(cat "$TEMP_DIR/final_pref.json")
-                fi
-            fi
-        fi
-
-        local http_code
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -b "$TEMP_DIR/qb_cookie.txt" \
-            -X POST --data-urlencode "json=$final_payload" "http://127.0.0.1:$QB_WEB_PORT/api/v2/app/setPreferences")
-
-        if [[ "$http_code" == "200" ]]; then
-            echo -e " ${GREEN}[√]${NC} 引擎配置下发完成。"
-            systemctl restart "qbittorrent-nox@$APP_USER"
-        else
-            echo -e " ${RED}[X]${NC} API 注入失败 (Code: $http_code)，请手动配置。"
-        fi
-
-        rm -f "$TEMP_DIR/qb_cookie.txt" "$TEMP_DIR/"*pref.json
+    if qb_api_apply_preferences "$patch_file"; then
+        echo -e " ${GREEN}[√]${NC} 引擎配置下发完成。"
+        systemctl restart "qbittorrent-nox@$APP_USER"
     else
-        echo -e "\n ${RED}[X]${NC} qBittorrent WebUI 未能在 20 秒内响应！"
+        echo -e " ${RED}[X]${NC} API 注入失败，多次重试后仍未成功，请检查 WebUI/日志。"
     fi
+
+    rm -f "$patch_file"
 }
 
 install_apps() {
@@ -2125,7 +2170,7 @@ echo -e "${CYAN}       / _ | / __/ |/ _ \\ ${NC}"
 echo -e "${CYAN}      / __ |_\\ \\  / ___/ ${NC}"
 echo -e "${CYAN}     /_/ |_/___/ /_/     ${NC}"
 echo -e "${BLUE}================================================================${NC}"
-echo -e "${PURPLE}     ✦ Auto-Seedbox-PT (ASP) 极限部署引擎 v3.6.0 ✦${NC}"
+echo -e "${PURPLE}     ✦ Auto-Seedbox-PT (ASP) 极限部署引擎 v${ASP_VERSION} ✦${NC}"
 echo -e "${PURPLE}     ✦               作者：Supcutie              ✦${NC}"
 echo -e "${GREEN}    🚀 一键部署 qBittorrent + Vertex + FileBrowser 刷流引擎${NC}"
 echo -e "${YELLOW}   💡 GitHub：https://github.com/yimouleng/Auto-Seedbox-PT ${NC}"
@@ -2188,14 +2233,14 @@ echo ""
 if [[ "$DO_TUNE" == "true" ]]; then
     if [[ "$TUNE_MODE" == "1" ]]; then
         echo -e "  当前选定模式: ${RED}极限抢种 (Mode 1)${NC}"
-        echo -e "  运行策略:     静态基线 +（可选）动态护栏"
+        echo -e "  运行策略:     高吞吐开放基线 +（可选）低频动态护栏"
         [[ "$AUTOTUNE_ENABLE" == "true" ]] && echo -e "  动态控制器:   ${GREEN}启用 (-a)${NC}" || echo -e "  动态控制器:   ${YELLOW}未启用${NC}"
         echo ""
         echo -e "  ${YELLOW}3 秒后开始部署...${NC}"
         sleep 3
     else
         echo -e "  当前选定模式: ${GREEN}均衡保种 (Mode 2)${NC}"
-        echo -e "  运行策略:     静态参数 + systemd 护栏"
+        echo -e "  运行策略:     高吞吐开放基线 + 轻量兼容保种保护"
         if [[ "$tune_downgraded" == "true" ]]; then
             echo -e "  ${YELLOW}※ 内存不足，已强制降级 Mode 2${NC}"
         fi
@@ -2263,9 +2308,8 @@ install_qbit
 [[ "$DO_VX" == "true" || "$DO_FB" == "true" ]] && install_apps
 [[ "$DO_TUNE" == "true" ]] && optimize_system
 
-# PSI 自动启用逻辑：若未显式传 -a，但系统支持 PSI 且处于 Mode 1，则自动开启 M1 控制器部署。
-# 说明：M1 控制器本身仍包含 PSI/非 PSI 的运行时自适应回退逻辑；这里只决定是否安装/启用该控制器。
-# 动态控制器不再在 PSI 可用时自动等价启用；需要用户显式 -a。
+# M1 动态控制器只在用户显式传入 -a 时启用。
+# PSI 可用时会同时参考 PSI 与 MemAvailable；PSI 不可用时自动回退为 MemAvailable-only。
 install_autotune_m1
 install_psi_autodetect
 
@@ -2293,7 +2337,7 @@ EOF
 echo -e "  ▶ 调优模式 : $tune_str"
 echo -e "  ▶ 运行用户 : ${YELLOW}$APP_USER${NC}"
 
-# 安全提示：Mode 1 下为支持“PSI 后期开启自动启用 M1 控制器”，会生成 root-only 的 env（含 WebUI 密码）
+# 安全提示：Mode 1 下若启用 M1 动态控制器，会生成 root-only 的 env（含 WebUI 密码）
 if [[ "$TUNE_MODE" == "1" && -f "$AUTOTUNE_ENV" ]]; then
     echo -e "  🔐 安全提示 : ${YELLOW}已生成 root-only 控制器凭据 (${AUTOTUNE_ENV})${NC}"
 fi
@@ -2366,7 +2410,7 @@ echo -e "  ⚙️ qB 配置   : $HB/.config/qBittorrent"
 echo ""
 echo -e " ------------------------ ${CYAN}🛠️ 维护指令${NC} ------------------------"
 echo -e "  重启 qB : ${YELLOW}systemctl restart qbittorrent-nox@$APP_USER${NC}"
-echo -e "  动态控制器说明: 需要 ${YELLOW}-a${NC} opt-in 且系统支持 ${YELLOW}PSI${NC} 才会启用（开机自动检测）。"
+echo -e "  动态控制器说明: 需要 ${YELLOW}-a${NC} opt-in 才会启用；PSI 可用时联动 PSI，不可用时自动回退为 MemAvailable-only。"
 if [[ "$TUNE_MODE" == "1" && "$AUTOTUNE_ENABLE" == "true" ]]; then
 echo -e "  动态控制器 : ${YELLOW}systemctl status asp-qb-autotune.timer${NC}"
 echo -e "  动态日志   : ${YELLOW}journalctl -t asp-qb-autotune -n 50${NC}"
