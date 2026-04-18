@@ -35,7 +35,7 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
-ASP_VERSION="3.7.1"
+ASP_VERSION="3.7.2"
 
 QB_WEB_PORT=8080
 QB_BT_PORT=47878
@@ -1166,29 +1166,29 @@ prev="baseline"
 [[ "$want" == "$prev" ]] && exit 0
 
 if (( mem_total_mb <= 4096 )); then
-  BASE_CS=700; BASE_HO=120; BASE_PTT=120
-  GUARD_CS=320; GUARD_HO=60; GUARD_PTT=60
+  BASE_CS=700; BASE_HO=120
+  GUARD_CS=320; GUARD_HO=60
 elif (( mem_total_mb <= 8192 )); then
-  BASE_CS=1000; BASE_HO=160; BASE_PTT=160
-  GUARD_CS=420; GUARD_HO=80; GUARD_PTT=80
+  BASE_CS=1000; BASE_HO=160
+  GUARD_CS=420; GUARD_HO=80
 elif (( mem_total_mb <= 16384 )); then
-  BASE_CS=1300; BASE_HO=220; BASE_PTT=220
-  GUARD_CS=560; GUARD_HO=110; GUARD_PTT=110
+  BASE_CS=1300; BASE_HO=220
+  GUARD_CS=560; GUARD_HO=110
 elif (( mem_total_mb <= 32768 )); then
-  BASE_CS=1600; BASE_HO=280; BASE_PTT=280
-  GUARD_CS=720; GUARD_HO=140; GUARD_PTT=140
+  BASE_CS=1600; BASE_HO=280
+  GUARD_CS=720; GUARD_HO=140
 elif (( mem_total_mb <= 65536 )); then
-  BASE_CS=1900; BASE_HO=360; BASE_PTT=360
-  GUARD_CS=900; GUARD_HO=180; GUARD_PTT=180
+  BASE_CS=1900; BASE_HO=360
+  GUARD_CS=900; GUARD_HO=180
 elif (( mem_total_mb <= 131072 )); then
-  BASE_CS=2200; BASE_HO=440; BASE_PTT=440
-  GUARD_CS=1100; GUARD_HO=220; GUARD_PTT=220
+  BASE_CS=2200; BASE_HO=440
+  GUARD_CS=1100; GUARD_HO=220
 elif (( mem_total_mb <= 262144 )); then
-  BASE_CS=2500; BASE_HO=520; BASE_PTT=520
-  GUARD_CS=1250; GUARD_HO=260; GUARD_PTT=260
+  BASE_CS=2500; BASE_HO=520
+  GUARD_CS=1250; GUARD_HO=260
 else
-  BASE_CS=2800; BASE_HO=600; BASE_PTT=600
-  GUARD_CS=1400; GUARD_HO=300; GUARD_PTT=300
+  BASE_CS=2800; BASE_HO=600
+  GUARD_CS=1400; GUARD_HO=300
 fi
 
 if [[ "${DISK_CLASS:-ssd}" == "hdd" ]]; then
@@ -1197,12 +1197,12 @@ if [[ "${DISK_CLASS:-ssd}" == "hdd" ]]; then
 fi
 
 if [[ "$want" == "guard" ]]; then
-  CS=$GUARD_CS; HO=$GUARD_HO; PTT=$GUARD_PTT
+  CS=$GUARD_CS; HO=$GUARD_HO
   SB=$(( BASE_BUFFER / 2 ))
   SBF=150
   AIO=$(( BASE_AIO > 4 ? 4 : BASE_AIO ))
 else
-  CS=$BASE_CS; HO=$BASE_HO; PTT=$BASE_PTT
+  CS=$BASE_CS; HO=$BASE_HO
   SB=$BASE_BUFFER
   SBF=$BASE_FACTOR
   AIO=$BASE_AIO
@@ -1214,7 +1214,6 @@ import json
 patch = {
   "connection_speed": int(${CS}),
   "max_half_open_connections": int(${HO}),
-  "max_connec_per_torrent": int(${PTT}),
   "send_buffer_low_watermark": int(${BASE_LOW_BUFFER}),
   "send_buffer_watermark": int(${SB}),
   "send_buffer_watermark_factor": int(${SBF}),
@@ -1225,7 +1224,7 @@ PY
 
 if qb_ensure_login && qb_apply_patch "$PATCH_FILE"; then
   echo "$want" > "$STATE_FILE"
-  logger -t "$TAG" "state=${want} prev=${prev} memAvailMB=${mem_avail_mb} psiFullAvg10=${psi_full_avg10} cs=${CS} ho=${HO} ptt=${PTT} sb=${SB} sbf=${SBF} aio=${AIO}"
+  logger -t "$TAG" "state=${want} prev=${prev} memAvailMB=${mem_avail_mb} psiFullAvg10=${psi_full_avg10} cs=${CS} ho=${HO} sb=${SB} sbf=${SBF} aio=${AIO}"
 fi
 
 rm -f "$PATCH_FILE"
@@ -1468,7 +1467,14 @@ if major == "5":
 else:
     patch.update({"disk_cache": cache})
 
-if mode != "1":
+if mode == "1":
+    patch.update({
+        "max_connec": 0,
+        "max_connec_per_torrent": 0,
+        "max_uploads": 0,
+        "max_uploads_per_torrent": 0,
+    })
+else:
     if total <= 4096:
         mode_vals = dict(max_connec=1200, max_connec_per_torrent=80, max_uploads=250, max_uploads_per_torrent=25, max_half_open_connections=60, connection_speed=400, peer_timeout=120)
     elif total <= 8192:
@@ -2233,7 +2239,7 @@ echo ""
 if [[ "$DO_TUNE" == "true" ]]; then
     if [[ "$TUNE_MODE" == "1" ]]; then
         echo -e "  当前选定模式: ${RED}极限抢种 (Mode 1)${NC}"
-        echo -e "  运行策略:     高吞吐开放基线 +（可选）低频动态护栏"
+        echo -e "  运行策略:     高吞吐开放基线（连接/上传四项默认不设限） +（可选）低频动态护栏"
         [[ "$AUTOTUNE_ENABLE" == "true" ]] && echo -e "  动态控制器:   ${GREEN}启用 (-a)${NC}" || echo -e "  动态控制器:   ${YELLOW}未启用${NC}"
         echo ""
         echo -e "  ${YELLOW}3 秒后开始部署...${NC}"
