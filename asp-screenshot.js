@@ -245,7 +245,20 @@
             const url = `${SS_API}?file=${encodeURIComponent(opt.fullPath)}&n=${opt.n}&width=${opt.width}&head=${opt.head}&tail=${opt.tail}&fmt=jpg&zip=1`;
 
             fetch(url, { cache: "no-store" })
-                .then((r) => r.json().then((j) => ({ ok: r.ok, status: r.status, json: j })))
+                .then(async (r) => {
+                    const text = await r.text();
+                    let json = null;
+
+                    try {
+                    json = text ? JSON.parse(text) : {};
+                    } catch (e) {
+                    throw new Error(
+                        `截图服务返回的不是 JSON，HTTP ${r.status}，响应内容：${text.slice(0, 300) || "空响应"}`
+                    );
+                    }
+
+                    return { ok: r.ok, status: r.status, json };
+                })
                 .then(({ ok, status, json }) => {
                     if (!ok || !json || !json.base || !Array.isArray(json.files) || json.files.length === 0) {
                         throw new Error(json && json.error ? json.error : `请求失败 (HTTP ${status})`);
