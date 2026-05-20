@@ -97,6 +97,10 @@
             .filter((v, i, a) => a.indexOf(v) === i)
             .filter((v) => v >= 320 && v <= 3840);
         const presetNs = [6, 8, 10, 12, 16];
+        const presetFormats = [
+            { value: "jpg", label: "JPG" },
+            { value: "png", label: "PNG" }
+        ];
 
         const html = `
             <style>
@@ -136,7 +140,7 @@
                     <div class='ss-sub'>目标文件 <code>${escapeHtml(fileName)}</code></div>
                     <div class='ss-meta'>
                         <span class='ss-pill'>⚡ ${origW}${origH ? "x" + origH : "p"} 源解析度</span>
-                        <span class='ss-pill fmt'>📦 JPG + ZIP 归档</span>
+                        <span class='ss-pill fmt'>📦 JPG / PNG + ZIP 归档</span>
                     </div>
                 </div>
 
@@ -154,6 +158,13 @@
                         <div class='ss-input-box'><input id='ss_w' type='number' min='320' max='3840' value='${origW}'/></div>
                         <div class='ss-chip-row' id='ss_w_chips'>
                             ${presetWs.map((w) => `<span class='ss-chip' data-w='${w}'>${w}${w === origW ? "(原)" : ""}</span>`).join("")}
+                        </div>
+                    </div>
+
+                    <label>输出格式</label>
+                    <div class='ss-control'>
+                        <div class='ss-chip-row' id='ss_fmt'>
+                            ${presetFormats.map((fmt) => `<span class='ss-chip' data-fmt='${fmt.value}'>${fmt.label}</span>`).join("")}
                         </div>
                     </div>
 
@@ -192,6 +203,7 @@
                 const tail = document.getElementById("ss_tail");
                 const hv = document.getElementById("ss_head_v");
                 const tv = document.getElementById("ss_tail_v");
+                const fmtContainer = document.getElementById("ss_fmt");
 
                 head.addEventListener("input", () => (hv.textContent = head.value));
                 tail.addEventListener("input", () => (tv.textContent = tail.value));
@@ -212,16 +224,20 @@
 
                 bindChips("ss_n_chips", nInput, "data-n");
                 bindChips("ss_w_chips", wInput, "data-w");
+                bindChips("ss_fmt", fmtContainer, "data-fmt");
 
                 document.querySelector(`.ss-chip[data-n="6"]`)?.classList.add('active');
                 document.querySelector(`.ss-chip[data-w="${origW}"]`)?.classList.add('active');
+                document.querySelector(`.ss-chip[data-fmt="jpg"]`)?.classList.add('active');
             },
             preConfirm: () => {
+                const fmt = document.querySelector("#ss_fmt .ss-chip.active")?.getAttribute("data-fmt") || "jpg";
                 return {
                     n: clamp(document.getElementById("ss_n").value, 1, 20, 6),
                     width: clamp(document.getElementById("ss_w").value, 320, 3840, origW),
                     head: clamp(document.getElementById("ss_head").value, 0, 20, 5),
                     tail: clamp(document.getElementById("ss_tail").value, 0, 20, 5),
+                    fmt: presetFormats.some((item) => item.value === fmt) ? fmt : "jpg",
                     fullPath, meta
                 };
             }
@@ -236,13 +252,13 @@
 
             Swal.fire({
                 title: "截图生成中...",
-                html: `正在处理...<br><br><span style="font-size:13px;color:#aaa;">数量 <b>${opt.n}</b> | 宽度 <b>${opt.width}</b> | 掐头去尾 <b>${opt.head}% / ${opt.tail}%</b></span>`,
+                html: `正在处理...<br><br><span style="font-size:13px;color:#aaa;">数量 <b>${opt.n}</b> | 宽度 <b>${opt.width}</b> | 格式 <b>${opt.fmt.toUpperCase()}</b> | 掐头去尾 <b>${opt.head}% / ${opt.tail}%</b></span>`,
                 allowOutsideClick: false,
                 allowEscapeKey: false,
                 didOpen: () => Swal.showLoading()
             });
 
-            const url = `${SS_API}?file=${encodeURIComponent(opt.fullPath)}&n=${opt.n}&width=${opt.width}&head=${opt.head}&tail=${opt.tail}&fmt=jpg&zip=1`;
+            const url = `${SS_API}?file=${encodeURIComponent(opt.fullPath)}&n=${opt.n}&width=${opt.width}&head=${opt.head}&tail=${opt.tail}&fmt=${encodeURIComponent(opt.fmt)}&zip=1`;
 
             fetch(url, { cache: "no-store" })
                 .then(async (r) => {
@@ -287,7 +303,7 @@
                         <div class='ss-panel'>
                             <div class='ss-top'>
                                 文件：<code>${escapeHtml(fileName)}</code><br>
-                                参数：<span style="color:#4ec9b0;">${imgs.length}张 / ${opt.width}px</span>
+                                参数：<span style="color:#4ec9b0;">${imgs.length}张 / ${opt.width}px / ${opt.fmt.toUpperCase()}</span>
                             </div>
                             <div class='ss-grid-wrap'>
                                 <div class='ss-grid'>
